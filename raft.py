@@ -31,8 +31,6 @@ import time
 
 ELECTION_TIMEOUT_MIN_MS = 500
 ELECTION_TIMEOUT_MAX_MS = 1000
-# Poll the election deadline at 1/10 of the minimum timeout so a fired
-# deadline is acted on within ~10% of one election cycle.
 ELECTION_TICK_S = ELECTION_TIMEOUT_MIN_MS / 10 / 1000
 
 
@@ -236,7 +234,6 @@ class RaftNode(Node):
             last_log_index = message["body"]["last_log_index"]
             last_log_term = message["body"]["last_log_term"]
 
-            # §5.4.1: candidate's log must be at least as up-to-date as ours.
             candidate_up_to_date = last_log_term > self.record.last_term() or (
                 last_log_term == self.record.last_term()
                 and last_log_index >= self.record.last_index()
@@ -270,9 +267,6 @@ class RaftNode(Node):
         with self.lock:
             if self.become_follower_if_applicable(message):
                 return
-            # §5.1: drop replies whose term doesn't match our current
-            # election. Stale grants would otherwise cross term boundaries
-            # and push us to majority on votes never cast in this term.
             if self.state != State.CANDIDATE or message["body"]["term"] != self.term:
                 return
             if message["body"]["vote_granted"]:
@@ -333,15 +327,11 @@ class RaftNode(Node):
             time.sleep(ELECTION_TICK_S)
 
     def replication_loop(self):
-        # Replicate on demand (new entries / leader change), with a heartbeat
-        # fallback so follower election timeouts stay fresh.
         while True:
             with self.lock:
                 self.replicate_if_applicable()
             self.replication_signal.wait(timeout=0.1)
             self.replication_signal.clear()
-
-    ### Below are functions that don't hold locks ###
 
     def try_persist_or_forward_entry(self, entry: LogEntry, message: Message[Any]):
         if self.state == State.LEADER:
@@ -368,8 +358,6 @@ class RaftNode(Node):
         index = median(
             [self.record.last_index(), *self.follower_match_indexes.values()]
         )
-        # §5.4.2: a leader can only commit entries from its own term;
-        # earlier-term entries follow indirectly via the log-matching property.
         if self.commit_index < index and self.record.at(index)["term"] == self.term:
             self.commit_at(index, send_reply=True)
 
