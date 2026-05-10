@@ -148,3 +148,30 @@ intuition.
 - [ ] No new third-party dependencies introduced.
 - [ ] The note is written so a reader who has never seen the codebase can
       understand both the bug and why it matters.
+
+---
+
+## Version 0 scope
+
+This is the v0 implementation. The goal is narrow: pass Maelstrom `lin-kv`
+under the partition nemesis. Anything not needed for that goal is
+deliberately excluded.
+
+Out of scope for v0:
+
+- **Persistence.** `term`, `voted_for`, and the log live in memory only.
+  A node that restarts loses its state.
+- **Membership change.** The node set is fixed at INIT. No joint consensus,
+  no learners, no add/remove.
+- **Crash recovery.** A killed or restarted node is not expected to rejoin
+  the cluster cleanly. The partition nemesis cuts and heals network links
+  without killing processes, so the in-memory model is sufficient for the
+  v0 target.
+
+These are real gaps relative to a production Raft. They are listed here so
+a reader doesn't mistake the working baseline for a complete
+implementation. A non-exhaustive list of what's still missing beyond the
+exclusions above — pre-vote, CheckQuorum, log compaction / snapshots,
+ReadIndex and lease reads, the §5.3 conflict-index optimization, a no-op
+on election win, leadership transfer, a separable state machine — lives in
+the issue tracker, not here.
