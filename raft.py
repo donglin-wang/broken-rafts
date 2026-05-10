@@ -501,4 +501,4 @@ class RaftNode(Node):
         self.request_vote()
 
     def generate_election_timeout(self) -> timedelta:
-        return timedelta(milliseconds=randint(500, 2000))
+        return timedelta(milliseconds=randint(100, 500))
