@@ -29,6 +29,13 @@ import math
 import time
 
 
+ELECTION_TIMEOUT_MIN_MS = 500
+ELECTION_TIMEOUT_MAX_MS = 1000
+# Poll the election deadline at 1/10 of the minimum timeout so a fired
+# deadline is acted on within ~10% of one election cycle.
+ELECTION_TICK_S = ELECTION_TIMEOUT_MIN_MS / 10 / 1000
+
+
 class Record:
     def __init__(self):
         self.__entries: list[LogEntry] = []
@@ -323,7 +330,7 @@ class RaftNode(Node):
                     and self.state != State.LEADER
                 ):
                     self.trigger_election()
-            time.sleep(0.5)
+            time.sleep(ELECTION_TICK_S)
 
     def replication_loop(self):
         # Replicate on demand (new entries / leader change), with a heartbeat
@@ -501,4 +508,6 @@ class RaftNode(Node):
         self.request_vote()
 
     def generate_election_timeout(self) -> timedelta:
-        return timedelta(milliseconds=randint(100, 500))
+        return timedelta(
+            milliseconds=randint(ELECTION_TIMEOUT_MIN_MS, ELECTION_TIMEOUT_MAX_MS)
+        )
