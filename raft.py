@@ -60,7 +60,7 @@ class Record:
         if starting_index < 0:
             raise IndexError(f"Negative index {starting_index} is illegal")
         if starting_index == 0:
-            self.__entries = incoming_entries
+            self.__entries = list(incoming_entries)
             return
 
         incoming_pointer = 0
@@ -68,7 +68,12 @@ class Record:
         while local_pointer < len(self.__entries) and incoming_pointer < len(
             incoming_entries
         ):
-            self.__entries[local_pointer] = incoming_entries[incoming_pointer]
+            if (
+                self.__entries[local_pointer]["term"]
+                != incoming_entries[incoming_pointer]["term"]
+            ):
+                del self.__entries[local_pointer:]
+                break
             local_pointer += 1
             incoming_pointer += 1
         while incoming_pointer < len(incoming_entries):
@@ -136,10 +141,6 @@ class RaftNode(Node):
         }
 
         self.replication_signal = threading.Event()
-        self.background_tasks = [
-            threading.Thread(target=self.election_loop, daemon=True),
-            threading.Thread(target=self.replication_loop, daemon=True),
-        ]
 
         self.snapshot: dict[str, Any] = {}
         self.pending_replies: dict[int, Message[Any]] = {}
@@ -149,6 +150,7 @@ class RaftNode(Node):
             self.log(f"Initialization: {message}")
             self.node_id = message["body"]["node_id"]
             self.neighbors = message["body"]["node_ids"]
+            self.reset_deadline()
             self.send(
                 message["src"],
                 {
@@ -156,21 +158,37 @@ class RaftNode(Node):
                     "in_reply_to": message["body"]["msg_id"],
                 },
             )
+            threading.Thread(target=self.election_loop, daemon=True).start()
+            threading.Thread(target=self.replication_loop, daemon=True).start()
 
     def handle_append_entries(self, message: Message[AppendEntriesBody]):
         with self.lock:
             self.log(f"Appending entries: {message}")
-            self.election_deadline += self.generate_election_timeout()
-
             incoming_term = message["body"]["term"]
-            self.become_follower_if_applicable(message)
+
+            if incoming_term < self.term:
+                self.send(
+                    message["src"],
+                    {
+                        "type": MessageType.APPEND_ENTRIES_OK,
+                        "in_reply_to": message["body"]["msg_id"],
+                        "term": self.term,
+                        "success": False,
+                        "leader_id": self.leader,
+                        "prev_log_index": message["body"]["prev_log_index"],
+                    },
+                )
+                return
+
+            self.reset_deadline()
+            self.maybe_step_down(message)
+            self.maybe_accept_leader(message)
 
             prev_log_index = message["body"]["prev_log_index"]
             prev_log_term = message["body"]["prev_log_term"]
 
             if (
-                incoming_term < self.term
-                or not self.record.has_entry_at(prev_log_index)
+                not self.record.has_entry_at(prev_log_index)
                 or self.record.at(prev_log_index)["term"] != prev_log_term
             ):
                 self.send(
@@ -181,11 +199,13 @@ class RaftNode(Node):
                         "term": self.term,
                         "success": False,
                         "leader_id": self.leader,
+                        "prev_log_index": prev_log_index,
                     },
                 )
                 return
 
-            self.record.apply_entries(message["body"]["entries"], prev_log_index + 1)
+            entries = message["body"]["entries"]
+            self.record.apply_entries(entries, prev_log_index + 1)
 
             leader_commit = message["body"]["leader_commit"]
             if leader_commit > self.commit_index:
@@ -198,7 +218,7 @@ class RaftNode(Node):
                     "in_reply_to": message["body"]["msg_id"],
                     "term": self.term,
                     "success": True,
-                    "match_index": self.record.last_index(),
+                    "match_index": prev_log_index + len(entries),
                 },
             )
 
@@ -206,7 +226,7 @@ class RaftNode(Node):
         with self.lock:
             self.log(f"Append entries OK: {message}")
             if (
-                self.become_follower_if_applicable(message)
+                self.maybe_step_down(message)
                 or self.state != State.LEADER
                 or message["body"]["term"] != self.term
             ):
@@ -222,13 +242,16 @@ class RaftNode(Node):
                     self.follower_next_indexes[src],
                 )
             else:
-                self.follower_next_indexes[src] -= 1
+                self.follower_next_indexes[src] = min(
+                    self.follower_next_indexes[src],
+                    message["body"]["prev_log_index"],
+                )
 
             self.commit_and_reply_if_applicable()
 
     def handle_request_vote(self, message: Message[RequestVoteBody]):
         with self.lock:
-            self.become_follower_if_applicable(message)
+            self.maybe_step_down(message)
 
             incoming_term = message["body"]["term"]
             last_log_index = message["body"]["last_log_index"]
@@ -240,7 +263,7 @@ class RaftNode(Node):
             )
 
             vote_granted = (
-                self.voted_for is None
+                self.voted_for in (None, message["body"]["candidate_id"])
                 and incoming_term >= self.term
                 and candidate_up_to_date
             )
@@ -248,7 +271,7 @@ class RaftNode(Node):
                 self.leader = None
                 self.voted_for = message["body"]["candidate_id"]
                 self.term = incoming_term
-                self.election_deadline += self.generate_election_timeout()
+                self.reset_deadline()
 
             self.log(
                 f"Vote {'granted' if vote_granted else 'denied'} for {message['src']}"
@@ -265,7 +288,7 @@ class RaftNode(Node):
 
     def handle_request_vote_ok(self, message: Message[RequestVoteOkBody]):
         with self.lock:
-            if self.become_follower_if_applicable(message):
+            if self.maybe_step_down(message):
                 return
             if self.state != State.CANDIDATE or message["body"]["term"] != self.term:
                 return
@@ -332,6 +355,8 @@ class RaftNode(Node):
                 self.replicate_if_applicable()
             self.replication_signal.wait(timeout=0.1)
             self.replication_signal.clear()
+
+    ### Below are functions that don't hold locks ###
 
     def try_persist_or_forward_entry(self, entry: LogEntry, message: Message[Any]):
         if self.state == State.LEADER:
@@ -431,10 +456,8 @@ class RaftNode(Node):
             }
             self.send(neighbor, payload, ignore_log=True)
 
-    def become_follower_if_applicable(self, message: Message[Any]) -> bool:
+    def maybe_step_down(self, message: Message[Any]) -> bool:
         incoming_term = message["body"]["term"]
-        if "leader_id" in message["body"] and message["body"]["leader_id"] is not None:
-            self.leader = message["body"]["leader_id"]
 
         if incoming_term > self.term:
             self.log(f"Became follower {self.node_id}")
@@ -442,7 +465,9 @@ class RaftNode(Node):
             self.voted_for = None
             self.term = incoming_term
             self.votes.clear()
+            self.leader = None
             return True
+
         if (
             incoming_term == self.term
             and self.state == State.CANDIDATE
@@ -451,7 +476,15 @@ class RaftNode(Node):
             self.log(f"Became follower {self.node_id}")
             self.state = State.FOLLOWER
             return True
+
         return False
+
+    def maybe_accept_leader(self, message: Message[AppendEntriesBody]):
+        if (
+            message["body"].get("leader_id") is not None
+            and message["body"]["term"] >= self.term
+        ):
+            self.leader = message["body"]["leader_id"]
 
     def become_leader(self):
         self.log(f"Leader is now {self.node_id}")
@@ -494,8 +527,13 @@ class RaftNode(Node):
         self.voted_for = self.node_id
         self.votes = {self.node_id}
         self.request_vote()
+        if len(self.votes) >= majority(len(self.neighbors)):
+            self.become_leader()
 
     def generate_election_timeout(self) -> timedelta:
         return timedelta(
             milliseconds=randint(ELECTION_TIMEOUT_MIN_MS, ELECTION_TIMEOUT_MAX_MS)
         )
+
+    def reset_deadline(self):
+        self.election_deadline = datetime.now() + self.generate_election_timeout()

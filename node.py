@@ -102,6 +102,7 @@ class AppendEntriesOkBody(TypedDict):
     success: bool
     leader_id: NotRequired[str | None]
     match_index: NotRequired[int]
+    prev_log_index: NotRequired[int]
 
 
 class ReadBody(TypedDict):
