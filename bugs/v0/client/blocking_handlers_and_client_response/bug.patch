@@ -1,0 +1,101 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..afa2940 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -32,6 +32,7 @@ from node import (
+ ELECTION_TIMEOUT_MIN_MS = 500
+ ELECTION_TIMEOUT_MAX_MS = 1000
+ ELECTION_TICK_S = ELECTION_TIMEOUT_MIN_MS / 10 / 1000
++REPLICATION_TIMEOUT_S = 2.0
+ 
+ 
+ class Record:
+@@ -142,14 +143,20 @@ class RaftNode(Node):
+             MessageType.APPEND_ENTRIES: self.handle_append_entries,
+             MessageType.APPEND_ENTRIES_OK: self.handle_append_entries_ok,
+             MessageType.READ: self.handle_read,
++            MessageType.READ_OK: self.handle_forwarded_response,
+             MessageType.WRITE: self.handle_write,
++            MessageType.WRITE_OK: self.handle_forwarded_response,
+             MessageType.CAS: self.handle_cas,
++            MessageType.CAS_OK: self.handle_forwarded_response,
++            MessageType.ERROR: self.handle_forwarded_response,
+         }
+ 
+         self.replication_signal = threading.Event()
+ 
+         self.snapshot: dict[str, Any] = {}
+         self.pending_replies: dict[int, Message[Any]] = {}
++        self.pending_forwarded_replies: dict[int, Message[Any]] = {}
++        self.forwarded_replies: dict[int, Message[Any]] = {}
+ 
+     def handle_init(self, message: Message[InitBody]):
+         with self.lock:
+@@ -346,6 +353,12 @@ class RaftNode(Node):
+                 message,
+             )
+ 
++    def handle_forwarded_response(self, message: Message[Any]):
++        with self.lock:
++            in_reply_to = message["body"].get("in_reply_to")
++            if in_reply_to is not None:
++                self.forwarded_replies[in_reply_to] = message
++
+     def election_loop(self):
+         while True:
+             with self.lock:
+@@ -368,11 +381,51 @@ class RaftNode(Node):
+     def try_persist_or_forward_entry(self, entry: LogEntry, message: Message[Any]):
+         if self.state == State.LEADER:
+             self.record.append(entry)
+-            self.pending_replies[self.record.last_index()] = message
++            index = self.record.last_index()
++            self.pending_replies[index] = message
+             self.replication_signal.set()
+-            self.log(f"Pending reply at index {self.record.last_index()} for {message}")
++            self.log(f"Pending reply at index {index} for {message}")
++            deadline = time.monotonic() + REPLICATION_TIMEOUT_S
++            while self.commit_index < index and time.monotonic() < deadline:
++                time.sleep(0.01)
++            if self.commit_index < index:
++                self.pending_replies.pop(index, None)
++                self.send(
++                    message["src"],
++                    {
++                        "type": MessageType.ERROR,
++                        "code": ErrorCode.ABORT,
++                        "in_reply_to": reply_id(message),
++                        "text": "Timed out waiting for replication",
++                    },
++                )
+         elif self.leader is not None:
+-            self.forward(self.leader, message)
++            forwarded_body = dict(message["body"])
++            self.send(self.leader, forwarded_body)
++            forwarded_msg_id = forwarded_body["msg_id"]
++            self.pending_forwarded_replies[forwarded_msg_id] = message
++            deadline = time.monotonic() + REPLICATION_TIMEOUT_S
++            while (
++                forwarded_msg_id not in self.forwarded_replies
++                and time.monotonic() < deadline
++            ):
++                time.sleep(0.01)
++            self.pending_forwarded_replies.pop(forwarded_msg_id, None)
++            response = self.forwarded_replies.pop(forwarded_msg_id, None)
++            if response is None:
++                self.send(
++                    message["src"],
++                    {
++                        "type": MessageType.ERROR,
++                        "code": ErrorCode.ABORT,
++                        "in_reply_to": reply_id(message),
++                        "text": "Timed out waiting for leader response",
++                    },
++                )
++                return
++            response_body = dict(response["body"])
++            response_body["in_reply_to"] = reply_id(message)
++            self.send(message["src"], response_body)
+         else:
+             self.send(
+                 message["src"],
