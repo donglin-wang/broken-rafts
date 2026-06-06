@@ -28,7 +28,7 @@ owns those client promises. The uncommitted suffix may be overwritten by the
 new leader, and the old leader may never again have a valid reason to answer
 those clients.
 
-The buggy shape treats `pending_replies` as ordinary local bookkeeping. It is
+The buggy implementation treats `pending_replies` as ordinary local bookkeeping. It is
 actually leader-scoped state. It must be drained or cleared on every transition
 out of leadership, and a newly elected leader must start with an empty
 `pending_replies` table.

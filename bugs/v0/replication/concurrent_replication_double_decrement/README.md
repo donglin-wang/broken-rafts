@@ -130,7 +130,7 @@ exactly that correspondence. The moment two probes share a
 — they are duplicate reports of one underlying truth, and counting
 both double-counts the evidence.
 
-Two correct shapes:
+Two correct approaches:
 
 1. **Serialize the trigger.** Replication is fired from one place
    only — the background loop — so at most one in-flight probe per
@@ -156,7 +156,7 @@ that mutation. Fan-out on the request side — multiple call sites
 issuing what is logically the same probe — silently fans out the
 response side too, and any non-idempotent handler will overcount.
 
-The same shape shows up in:
+The same issue shows up in:
 
 - TCP duplicate ACK handling: a single lost packet can elicit many
   duplicate ACKs from the receiver, but the sender treats them as

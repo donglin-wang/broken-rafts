@@ -27,7 +27,7 @@ a dead older-term leader still:
 Only then does the term check fire and reject the message. By that
 point the side effects have already happened.
 
-The fix is the canonical RPC handler shape: reject by term first,
+The fix is the canonical RPC handler logic: reject by term first,
 *then* mutate state.
 
 ```python
@@ -130,7 +130,7 @@ An RPC handler has two phases, and they have to stay in order:
 2. **Process.** Update local state, emit replies, run side effects.
 
 Mixing the two — running side effects before validation completes —
-is the same shape as a web handler that writes to the database
+is the same bug as a web handler that writes to the database
 before checking the auth token. It "works" in the happy path
 because no malicious or stale requests arrive, and it fails
 silently the moment one does.

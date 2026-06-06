@@ -129,7 +129,7 @@ completes in term 1 — exactly what the protocol intended.
 
 ## Why the Cluster Doesn't Always Catch You
 
-Same shape as the other "asynchrony-only" Raft bugs in this set: at
+Same failure mode as the other "asynchrony-only" Raft bugs in this set: at
 reliable-network rates, every `RequestVote` reply gets through on
 the first send, no retries are needed, and the buggy clause is never
 exercised. The bug is latent under quiet runs and reliably visible
@@ -174,7 +174,7 @@ must support *idempotent re-confirmation* by the original initiator
 of X. The original asker is allowed (and often required) to ask
 again; the receiver's answer must be stable.
 
-The same shape shows up in:
+The same issue shows up in:
 
 - **Two-phase commit prepare votes.** A participant that voted YES
   must repeat YES on retry. Refusing the retry forces the

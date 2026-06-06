@@ -29,7 +29,7 @@ if (
     return
 ```
 
-Same shape you already apply (or should apply) at every other
+Same guard you already apply (or should apply) at every other
 incoming-RPC handler. §5.1 of the Raft paper states it as a universal
 rule: *"if a server receives a request with a stale term number, it
 rejects the request."* The same must hold for replies — a reply from
@@ -118,7 +118,7 @@ on purpose.
 It also compounds badly with the bug where `match_index` is
 derived from the leader's current log state instead of the request
 that elicited the ack. If you've fixed that one with the
-"echo back" shape so the follower's reply carries the precise
+"echo back" approach so the follower's reply carries the precise
 `prev_log_index` and accepted-count, the reply now contains an
 authoritative-looking `match_index` value — and the stale-term
 filter is what stops you from believing it.
@@ -166,7 +166,7 @@ term doesn't trigger step-down at all but should still drop the
 message. A helper that only does step-down on `>` will silently let
 stale `<`-term replies through.
 
-The same shape shows up wherever there's a logical clock and
+The same rule shows up wherever there's a logical clock and
 asynchronous replies:
 
 - Lamport-clock RPCs that carry a sender clock alongside the body.

@@ -57,7 +57,7 @@ Participants hold row-level locks after PREPARE, waiting for the
 coordinator's COMMIT/ABORT. The coordinator crashes. Every
 transaction that touched those rows blocks until the participant
 decides to presume-abort. Not a symmetric cycle, but the same
-shape: local state is pinned by the expectation of a specific
+logic applies: local state is pinned by the expectation of a specific
 remote message.
 
 ### Distributed Lock with Client Pause

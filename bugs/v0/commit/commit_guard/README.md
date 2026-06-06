@@ -133,7 +133,7 @@ Code that translates the rule into `if leader.something == ...`
 instead of `if entry_at(index).something == ...` has dropped the
 subject and is asking a different question.
 
-The same shape shows up elsewhere:
+The same mistake shows up elsewhere:
 
 - §5.4.1 election check ("candidate's log is at least as up-to-date
   as receiver's log") — about the *candidate's last entry* and

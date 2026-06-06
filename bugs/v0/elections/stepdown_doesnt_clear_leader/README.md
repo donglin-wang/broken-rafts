@@ -196,7 +196,7 @@ when the authority changes — and "I just learned the authority
 changed" is the change event. Don't wait for the new authority to
 announce itself; the cached value is already known to be wrong.
 
-The same shape shows up in:
+The same issue shows up in:
 
 - **DNS resolver caches** during a primary-replica failover: the
   cached IP of the old primary is wrong the moment the failover

@@ -60,7 +60,7 @@ The trap is the `n=1` edge case. Majority of 1 is 1. The self-vote
 expected, so the only check site is unreachable, and the
 threshold-crossing event has no place to fire.
 
-It is the same shape as "off-by-one at the empty boundary": code
+It is the same bug class as "off-by-one at the empty boundary": code
 that operates on `n ≥ 2` and silently does nothing for `n = 1`.
 
 ## Why It Matters
@@ -136,7 +136,7 @@ distributed-systems code. The diagnostic question to ask is
 the answer is `n ≥ 2`, the code is incomplete unless the broader
 system enforces `n ≥ 2` somewhere.
 
-The same shape shows up in:
+The same boundary case shows up in:
 
 - **Consensus protocols generally.** Paxos, ZAB, and others all
   have the same "self-vote counts" subtlety. Implementations that

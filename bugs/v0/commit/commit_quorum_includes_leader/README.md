@@ -118,4 +118,4 @@ elected without it."
 
 The leader is a participant in that majority, not a referee on the
 sidelines counting the others. Treating it as the latter is the
-specific shape of the bug.
+specific logic error in this bug.

@@ -19,7 +19,7 @@ def handle_write(message):
             relay_reply_to_client(message)
 ```
 
-That shape is wrong for Raft. Replication is an asynchronous protocol. A
+That implementation is wrong for Raft. Replication is an asynchronous protocol. A
 handler may append or forward, but it must not hold the node lock while waiting
 for remote progress.
 
@@ -29,7 +29,7 @@ other handlers needed by that wait can still run." In this implementation,
 every Raft handler starts by taking the same node lock, so those other handlers
 often cannot run.
 
-The canonical v0 shape separates the concerns:
+The canonical v0 logic separates the concerns:
 
 - `handle_write`, `handle_read`, and `handle_cas` append or forward and then
   return.

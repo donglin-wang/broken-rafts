@@ -11,7 +11,7 @@ That is a safety bug, not an optimization. Only the leader is allowed
 to extend the log. A follower that appends locally creates **phantom
 entries** that no leader has sanctioned, and those phantoms can win
 elections, propagate to the cluster, and produce double-applies —
-the symptom shape is that a client observes state that no quorum
+the symptom is that a client observes state that no quorum
 ever stored, but the root cause here is forged log entries on the
 follower rather than reads outrunning commit.
 

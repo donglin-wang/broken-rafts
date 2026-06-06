@@ -2,7 +2,7 @@
 
 A gallery of Raft implementation bugs, each tied to a canonical Raft KV-store
 implementation and explained as a concrete failure mode. The goal is to make
-wrong implementation shapes legible: what changed, why it looked reasonable,
+wrong implementations legible: what changed, why the code looked reasonable,
 and how it breaks under Maelstrom's `lin-kv` workload.
 
 ## Get Started
@@ -88,8 +88,8 @@ maelstrom test -w lin-kv --bin './main.py --version <version>' \
 
 A bug writeup should be concrete and reproducible. Use this section structure:
 
-1. `## Description` - define the bug, show the buggy shape, and explain why it
-   is wrong.
+1. `## Description` - define the bug, show the buggy code or logic, and
+   explain why it is wrong.
 2. `## Examples` - give elaborate concrete executions that expose the bug.
 3. `### Example <number>` - one numbered subsection per elaborate example.
 4. `## Additional issues` - document related problems that can arise but do

@@ -49,7 +49,7 @@ is acted on.
 
 ## Why It Looks Reasonable
 
-`set()` is exactly the right shape for "collect votes, deduplicate,
+`set()` is exactly the right data structure for "collect votes, deduplicate,
 check threshold." Adding the same node twice doesn't double-count; the
 threshold check is a single `len() >= majority`. A Raft author thinking
 *term-locally* writes exactly this code.
@@ -202,8 +202,8 @@ asynchronous replies:
   generation" set must be cleared when the generation advances. Acks
   for a prior generation must be filtered out.
 - **View-stamped replication, Paxos.** A proposer's "I have N
-  promises for this proposal number" tally is the same shape as
-  Raft's `votes`. Same two rules.
+  promises for this proposal number" tally follows the same term-scoped
+  logic as Raft's `votes`. Same two rules.
 - **Round-based BFT consensus.** Every round-based message carries a
   round number, and every receiver tally is round-scoped. Same two
   rules.

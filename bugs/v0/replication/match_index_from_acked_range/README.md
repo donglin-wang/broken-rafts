@@ -115,7 +115,7 @@ acknowledges. The leader has to reconstruct that from the request that
 elicited the response — and the leader is the one that sent the
 request, so it knew the answer at send time.
 
-There are two correct shapes:
+There are two correct approaches:
 
 1. **Stamp the request.** Include `prev_log_index` and `len(entries)`
    in the AppendEntries; on success, set
@@ -147,7 +147,7 @@ the request/response pair, you have introduced an implicit assumption
 that nothing else moved between send and receive. That assumption is
 false in any system worth building.
 
-The same shape shows up in:
+The same issue shows up in:
 
 - HTTP retries replaying a stale request body against a moved-on server.
 - Cache-invalidation messages whose payload describes "what was true

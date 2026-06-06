@@ -27,11 +27,11 @@ authoritative:
 3. **Stale-term `AppendEntries`.** A delayed message from a dead
    older-term leader.
 
-Only one shape carries an authoritative `leader_id`: a
+Only one message type carries an authoritative `leader_id`: a
 **current-or-higher-term `AppendEntries`** received as a fresh
 heartbeat or replication message. Everything else is hearsay.
 
-The fix is to restrict the update to that one shape — i.e., move it
+The fix is to restrict the update to that one case: move it
 out of `become_follower_if_applicable` and into the body of
 `handle_append_entries`, after the term check.
 

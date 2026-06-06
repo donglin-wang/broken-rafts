@@ -140,8 +140,8 @@ term-confusion bugs to wedge things further.
 ## The Right Mental Model
 
 A daemon thread that periodically does work is a *consumer* of
-shared state. The state it consumes must be in a valid post-
-initialization shape before the thread is allowed to run.
+shared state. The state it consumes must be valid and fully initialized
+before the thread is allowed to run.
 
 In single-threaded code, "initialize, then run the event loop" is
 the obvious enforcement: the event loop *is* the only consumer, so
@@ -175,7 +175,7 @@ gone and the bug returns in a more subtle form (loops see partial
 state). This is the kind of thing that decays over time as the
 codebase grows; if you've ever seen a Python service that worked
 fine for years and suddenly started racing after an innocuous
-refactor, this is one of the shapes.
+refactor, this is one of the failure modes.
 
 The guard-each-loop-body option is more resilient against that
 decay because the guard itself remains visible. The lazy-start
@@ -199,7 +199,7 @@ The same pattern shows up in:
   first request arrives mid-init; the handler reads partial state.
 - **JVM `static` initializer ordering.** Threads spawned from one
   class's static init can observe other classes mid-init,
-  producing the same shape of race.
+  producing the same race.
 
 The mechanical rule: pair every "I depend on X being initialized"
 loop body with a corresponding "X is initialized" creation site.
