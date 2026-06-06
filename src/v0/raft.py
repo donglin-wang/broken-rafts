@@ -1,33 +1,33 @@
+import math
+import threading
+import time
+from datetime import datetime, timedelta
+from enum import StrEnum, auto
+from random import randint
+from typing import Any, Iterable
+
 from node import (
-    Node,
-    MessageType,
-    Message,
-    LogEntry,
-    ErrorCode,
-    WriteOperation,
-    CompareAndSetOperation,
-    ReadOperation,
-    InitBody,
-    RequestVoteBody,
-    RequestVoteOkBody,
     AppendEntriesBody,
     AppendEntriesOkBody,
-    ReadBody,
-    ReadOkBody,
-    WriteBody,
-    WriteOkBody,
     CasBody,
     CasOkBody,
+    CompareAndSetOperation,
     ErrorBody,
+    ErrorCode,
+    InitBody,
+    LogEntry,
+    Message,
+    MessageType,
+    Node,
+    ReadBody,
+    ReadOkBody,
+    ReadOperation,
+    RequestVoteBody,
+    RequestVoteOkBody,
+    WriteBody,
+    WriteOkBody,
+    WriteOperation,
 )
-from typing import Any, Iterable
-from enum import StrEnum, auto
-from datetime import timedelta, datetime
-from random import randint
-import threading
-import math
-import time
-
 
 ELECTION_TIMEOUT_MIN_MS = 500
 ELECTION_TIMEOUT_MAX_MS = 1000
@@ -104,6 +104,12 @@ class State(StrEnum):
     FOLLOWER = auto()
 
 
+def reply_id(message: Message[Any]) -> int:
+    msg_id = message["body"].get("msg_id")
+    assert msg_id is not None, f"received message missing msg_id: {message}"
+    return msg_id
+
+
 def majority(n: int) -> int:
     return math.floor((n / 2.0) + 1)
 
@@ -155,7 +161,7 @@ class RaftNode(Node):
                 message["src"],
                 {
                     "type": MessageType.INIT_OK,
-                    "in_reply_to": message["body"]["msg_id"],
+                    "in_reply_to": reply_id(message),
                 },
             )
             threading.Thread(target=self.election_loop, daemon=True).start()
@@ -171,7 +177,7 @@ class RaftNode(Node):
                     message["src"],
                     {
                         "type": MessageType.APPEND_ENTRIES_OK,
-                        "in_reply_to": message["body"]["msg_id"],
+                        "in_reply_to": reply_id(message),
                         "term": self.term,
                         "success": False,
                         "leader_id": self.leader,
@@ -195,7 +201,7 @@ class RaftNode(Node):
                     message["src"],
                     {
                         "type": MessageType.APPEND_ENTRIES_OK,
-                        "in_reply_to": message["body"]["msg_id"],
+                        "in_reply_to": reply_id(message),
                         "term": self.term,
                         "success": False,
                         "leader_id": self.leader,
@@ -215,7 +221,7 @@ class RaftNode(Node):
                 message["src"],
                 {
                     "type": MessageType.APPEND_ENTRIES_OK,
-                    "in_reply_to": message["body"]["msg_id"],
+                    "in_reply_to": reply_id(message),
                     "term": self.term,
                     "success": True,
                     "match_index": prev_log_index + len(entries),
@@ -233,18 +239,19 @@ class RaftNode(Node):
                 return
 
             src = message["src"]
-            if message["body"]["success"]:
+            body = message["body"]
+            if body["success"] is True:
                 self.follower_match_indexes[src] = max(
-                    message["body"]["match_index"], self.follower_match_indexes[src]
+                    body["match_index"], self.follower_match_indexes[src]
                 )
                 self.follower_next_indexes[src] = max(
-                    message["body"]["match_index"] + 1,
+                    body["match_index"] + 1,
                     self.follower_next_indexes[src],
                 )
             else:
                 self.follower_next_indexes[src] = min(
                     self.follower_next_indexes[src],
-                    message["body"]["prev_log_index"],
+                    body["prev_log_index"],
                 )
 
             self.commit_and_reply_if_applicable()
@@ -280,7 +287,7 @@ class RaftNode(Node):
                 message["src"],
                 {
                     "type": MessageType.REQUEST_VOTE_OK,
-                    "in_reply_to": message["body"]["msg_id"],
+                    "in_reply_to": reply_id(message),
                     "term": self.term,
                     "vote_granted": vote_granted,
                 },
@@ -372,7 +379,7 @@ class RaftNode(Node):
                 {
                     "type": MessageType.ERROR,
                     "code": ErrorCode.TEMPORARILY_UNAVAILABLE,
-                    "in_reply_to": message["body"]["msg_id"],
+                    "in_reply_to": reply_id(message),
                     "text": "No leader elected",
                 },
             )
@@ -424,7 +431,6 @@ class RaftNode(Node):
                 }
             self.snapshot[key] = op["value_to"]
             return {"type": MessageType.CAS_OK}
-        raise ValueError(f"Unknown op type: {op['type']}")
 
     def reply_to_client(
         self, index: int, body: ReadOkBody | WriteOkBody | CasOkBody | ErrorBody
@@ -432,7 +438,7 @@ class RaftNode(Node):
         message = self.pending_replies.pop(index, None)
         if message is None:
             return
-        body["in_reply_to"] = message["body"]["msg_id"]
+        body["in_reply_to"] = reply_id(message)
         self.send(message["src"], body)
 
     def replicate_if_applicable(self):

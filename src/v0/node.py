@@ -94,15 +94,29 @@ class AppendEntriesBody(TypedDict):
     leader_commit: int
 
 
-class AppendEntriesOkBody(TypedDict):
+class AppendEntriesOkSuccessBody(TypedDict):
     type: Literal[MessageType.APPEND_ENTRIES_OK]
     msg_id: NotRequired[int]
     in_reply_to: int
     term: int
-    success: bool
-    leader_id: NotRequired[str | None]
-    match_index: NotRequired[int]
-    prev_log_index: NotRequired[int]
+    success: Literal[True]
+    match_index: int
+
+
+class AppendEntriesOkFailBody(TypedDict):
+    type: Literal[MessageType.APPEND_ENTRIES_OK]
+    msg_id: NotRequired[int]
+    in_reply_to: int
+    term: int
+    success: Literal[False]
+    leader_id: str | None
+    prev_log_index: int
+
+
+# Discriminated on `success`: a success reply carries match_index, a failure
+# reply carries prev_log_index. Splitting them lets the type checker know which
+# field is present in each branch.
+AppendEntriesOkBody = AppendEntriesOkSuccessBody | AppendEntriesOkFailBody
 
 
 class ReadBody(TypedDict):
