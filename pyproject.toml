@@ -11,8 +11,13 @@ project-includes = [
     "**/*.py*",
     "**/*.ipynb",
 ]
+# Each version dir under src/ is inserted onto sys.path at runtime (see main.py),
+# so modules like `node` are imported flat. Mirror that for pyrefly's resolver.
+search-path = [
+    "src/v0",
+]
 
 [dependency-groups]
 dev = [
-    "pyrefly>=0.64.1",
+    "pyright>=1.1.410",
 ]

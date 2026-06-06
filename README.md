@@ -30,20 +30,16 @@ maelstrom test \
   --nemesis partition
 ```
 
-Read a bug writeup:
-
-```bash
-cat bugs/v0/replication/safety/match_index_from_acked_range.md
-```
+Browse the `bugs/` folder for writeups.
 
 For patch-backed bugs, apply the patch to the matching canonical version,
 run Maelstrom, then reverse the patch:
 
 ```bash
-git apply bugs/v0/<category>/<bug>/bug.patch
+git apply <path-to-bug>/bug.patch
 maelstrom test -w lin-kv --bin './main.py --version v0' --time-limit 60 \
   --node-count 3 --concurrency 4n --rate 30 --nemesis partition
-git apply -R bugs/v0/<category>/<bug>/bug.patch
+git apply -R <path-to-bug>/bug.patch
 ```
 
 ## Layout
@@ -54,8 +50,7 @@ git apply -R bugs/v0/<category>/<bug>/bug.patch
   - `raft.py` contains the Raft node and KV state machine.
   - `node.py` contains the Maelstrom JSON protocol plumbing.
 - `bugs/v0/` - v0 bug writeups and, for patch-backed bugs, patch artifacts.
-  Bugs are organized by subsystem and failure type, for example
-  `bugs/v0/replication/safety/`.
+  Bugs are organized by subsystem. Browse the folder for the current set.
 - `src/README.md` - short note on canonical implementation versioning.
 - `pyproject.toml` / `uv.lock` - Python project metadata and locked tooling.
 
@@ -68,7 +63,7 @@ New bugs should be added as patch-backed specimens against a specific canonical
 version.
 
 1. Choose the canonical version the bug applies to, such as `v0`.
-2. Add a directory under `bugs/<version>/<subsystem>/<type>/<short_name>/`.
+2. Add a directory under `bugs/<version>/<subsystem>/<short_name>/`.
 3. Include:
    - `README.md` - the explanatory writeup.
    - `bug.patch` - the minimal patch that turns the canonical implementation
@@ -80,7 +75,7 @@ version.
 5. Verify the patch applies:
 
 ```bash
-git apply --check bugs/<version>/<subsystem>/<type>/<short_name>/bug.patch
+git apply --check bugs/<version>/<subsystem>/<short_name>/bug.patch
 ```
 
 6. Verify the bug reliably reproduces with Maelstrom. The default target is:
