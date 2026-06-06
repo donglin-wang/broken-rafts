@@ -1,0 +1,39 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..8ba484c 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -307,13 +307,27 @@ class RaftNode(Node):
+     def handle_read(self, message: Message[ReadBody]):
+         with self.lock:
+             self.log(f"Reading: {message}")
+-            self.try_persist_or_forward_entry(
+-                {
+-                    "term": self.term,
+-                    "op": {"type": "read", "key": message["body"]["key"]},
+-                },
+-                message,
+-            )
++            if self.state == State.LEADER:
++                self.send(
++                    message["src"],
++                    {
++                        "type": MessageType.READ_OK,
++                        "in_reply_to": reply_id(message),
++                        "value": self.snapshot.get(message["body"]["key"]),
++                    },
++                )
++            elif self.leader is not None:
++                self.forward(self.leader, message)
++            else:
++                self.send(
++                    message["src"],
++                    {
++                        "type": MessageType.ERROR,
++                        "code": ErrorCode.TEMPORARILY_UNAVAILABLE,
++                        "in_reply_to": reply_id(message),
++                        "text": "No leader elected",
++                    },
++                )
+ 
+     def handle_write(self, message: Message[WriteBody]):
+         with self.lock:
