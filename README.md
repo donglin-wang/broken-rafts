@@ -86,16 +86,21 @@ maelstrom test -w lin-kv --bin './main.py --version <version>' \
   --nemesis partition
 ```
 
-A bug writeup should be concrete and reproducible. Prefer this shape:
+A bug writeup should be concrete and reproducible. Use this section structure:
 
-1. **The Bug** - show the buggy code.
-2. **Why It Looks Reasonable** - explain the tempting mental model.
-3. **The Asynchrony You Forgot** - name the runtime condition that exposes it.
-4. **A Trace That Goes Unsafe** - walk through one failing execution.
-5. **Why The Cluster Doesn't Always Catch You** - explain why it hides.
-6. **The Right Mental Model** - state the corrected rule.
-7. **The General Lesson** - generalize beyond this exact line of code.
-8. **Related** - link neighboring bug specimens or concept notes.
+1. `## Description` - define the bug, show the buggy shape, and explain why it
+   is wrong.
+2. `## Examples` - give elaborate concrete executions that expose the bug.
+3. `### Example <number>` - one numbered subsection per elaborate example.
+4. `## Additional issues` - document related problems that can arise but do
+   not need full worked examples.
+5. `## Implementaiton note` - explain the correct implementation approach and
+   the mental model to use.
+
+Prefer Mermaid diagrams for executions and dependency cycles. Sequence diagrams
+work well for message traces; flowcharts work well for wait-for or causality
+cycles. Keep diagrams tied to concrete node names, message types, and state
+fields from the matching canonical implementation.
 
 Code conventions:
 

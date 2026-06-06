@@ -1,166 +1,184 @@
-# Blocking Inside Message Handlers
+# Blocking Replication Inside Client Handlers
 
-## TL;DR
+## Description
 
-My first Raft implementation treated message handlers as synchronous RPCs:
-a client `write` handler would append to the log, *block* waiting for a
-majority of followers to ack, and only then return. That design is wrong —
-not just slow, but correctness-hostile — and fixing it required a real
-mental-model shift.
+The bug is treating a Raft client handler as a synchronous RPC that should
+return only after the operation has replicated and the client has an answer:
 
-## What I Built First
-
-`handle_write` held the node lock and called a `replicate_blocking`
-helper, which sent `AppendEntries` to every peer and spin-waited on a
-`pending_ok` dict until a majority had responded (or a 2-second timeout
-expired). Only then did `handle_write` send `write_ok` back to the client.
-
-Effectively:
-
-```
-handle_write(msg):
-    with lock:
-        append to log
-        send AppendEntries to all peers
-        wait up to 2s for majority acks   # <-- still holding lock
-        send write_ok to client
+```python
+def handle_write(message):
+    with self.lock:
+        if self.state == LEADER:
+            index = append_to_log(message)
+            send_append_entries_to_followers(index)
+            wait_until_replicated(index)     # still holding self.lock
+            apply_and_reply_to_client(index)
+        else:
+            forward_to_leader(message)
+            wait_for_leader_reply(message)   # still holding self.lock
+            relay_reply_to_client(message)
 ```
 
-## Why It's Wrong
+That shape is wrong for Raft. Replication is an asynchronous protocol. A
+handler may append or forward, but it must not hold the node lock while waiting
+for remote progress.
 
-1. **Lock starvation under load.** The handler holds the node lock while
-   spin-waiting. Every other handler (vote requests, heartbeats, peer
-   acks) queues behind it. At high write rates the cluster grinds to a
-   halt — and ironically the acks the handler is waiting for can't be
-   processed, because their handler also needs the lock.
-2. **One write serializes the node.** Raft's whole point is pipelined
-   replication. A synchronous handler turns the leader into a one-write-
-   at-a-time box.
-3. **It conflates two separate events.** "Handler returns" and "client
-   gets `write_ok`" are not the same moment. The former is a local
-   scheduling detail; the latter is a durability guarantee. Fusing them
-   forces the handler to block.
-4. **It doesn't generalize to the commit rule.** Real Raft replies to a
-   client only when the entry is *committed* per the leader's commit
-   rule (majority `matchIndex` ≥ N, entry is in current term). A
-   synchronous handler can't express "reply when commit_index advances
-   past N" — it only knows "reply when my specific RPCs came back."
+Blocking replication logic changes the protocol's liveness properties. It
+turns "wait until any majority has the entry" into "park a handler and hope all
+other handlers needed by that wait can still run." In this implementation,
+every Raft handler starts by taking the same node lock, so those other handlers
+often cannot run.
 
-## Case Study: Two Nodes Deadlock Each Other
+The canonical v0 shape separates the concerns:
 
-The "ironically the acks can't be processed" claim under reason (1)
-has a nastier two-node variant that shows up constantly under
-concurrent load. It's a distinct mechanism from single-node
-tight-loop lock starvation — this one is a genuine cycle between
-separate machines.
+- `handle_write`, `handle_read`, and `handle_cas` append or forward and then
+  return.
+- The replication loop sends `AppendEntries`.
+- `handle_append_entries_ok` advances follower match indexes.
+- `commit_at(..., send_reply=True)` replies to the original client only when
+  the committed prefix crosses the operation's log index.
 
-### Setup
+## Examples
 
-Leader n4, follower n1. Jepsen client `c16` writes directly to n4.
-Client `c19` writes to n1. Both arrive at T=0. At `--rate 100` with
-multiple clients per node this overlap is not an edge case; it is
-the common case.
+### Example 1
 
-### Trace
+A two-node cluster is enough to break the blocking design. The cluster is
+`n0, n1`; `n0` is leader. In a two-node cluster, majority is 2, so `n0` needs
+`n1`'s ack before it can commit.
 
-**T=0+ε** — handler threads launch on both nodes:
+Client `c1` sends `write x=1` to follower `n1`.
 
-- **n4** acquires `n4.lock`, appends c16's entry, sends
-  `append_entries` with msg_ids `A0, A1, A2, A3` to n0–n3, enters
-  `wait_for([A0..A3])` — *still holding `n4.lock`*.
-- **n1** acquires `n1.lock`, appends c19's entry. It is not leader,
-  so `persist_write` calls `send_blocking(n4, c19_body)` to forward
-  the request, enters `wait_for([W2])` — *still holding `n1.lock`*.
+```mermaid
+sequenceDiagram
+    participant C as c1
+    participant F as n1 follower
+    participant L as n0 leader
 
-**T≈10ms** — cross-traffic arrives:
+    C->>F: write x=1
+    Note over F: handle_write takes n1.lock
+    F->>L: forward write x=1
+    Note over F: waits for leader reply<br/>while still holding n1.lock
 
-- On **n1**: n4's `append_entries` (msg_id `A1`) arrives.
-  `handle_append_entries` spawns a thread; its first line is
-  `with self.lock:`, which blocks on `n1.lock`. `A1` cannot be
-  acked until n1 releases that lock.
-- On **n4**: n1's forwarded write (msg_id `W2`) arrives.
-  `handle_write` spawns a thread; it blocks on `n4.lock`. `W2`
-  cannot be acked until n4 releases that lock.
-- n0, n2, n3 (idle) ack instantly; `A0, A2, A3` pop from
-  `pending_ok`. But `A1` doesn't, so n4's `wait_for` keeps spinning.
+    Note over L: handle_write takes n0.lock
+    L->>L: append entry i
+    L->>F: AppendEntries(i)
+    Note over L: waits for majority ack<br/>while still holding n0.lock
 
-### The Cycle
+    Note over F: handle_append_entries(i)<br/>cannot take n1.lock
+    Note over L,F: n0 cannot commit without n1's ack.<br/>n1 cannot ack until its forward wait ends.<br/>The forward wait cannot end until n0 commits.
+```
 
-    n4.wait_for ── needs A1 ack ── needs n1.lock
-        ▲                              │
-        │                              ▼
-     n4.lock ── needed by W2 ack ── n1.wait_for
+The cycle is:
 
-Neither handler can exit its `wait_for` until the 2-second watchdog
-fires, because each is waiting for a response that requires the
-other's lock to be released.
+```mermaid
+flowchart LR
+    L["n0 leader<br/>waiting to commit entry i"]
+    F["n1 follower<br/>waiting for forwarded write reply"]
+    AE["n1 handle_append_entries<br/>needs n1.lock"]
 
-### Consequences
+    L -- needs replication ack --> AE
+    AE -- blocked by lock held in --> F
+    F -- needs client reply from --> L
+```
 
-- Every overlap of this shape costs a 2-second stall on both nodes.
-- The 300ms `replication_loop` is also gated on `self.lock`, so it
-  doesn't fire during the stall. Even if it did, its sends carry
-  *fresh* msg_ids, not `A1` — popping those wouldn't unblock the
-  caller waiting specifically on `A1`.
-- n4's `wait_for` eventually returns 3 (plus a bogus +1 from the
-  skip_node bonus when skip_node isn't a neighbor), so c16's write
-  succeeds with 2s latency. n1's `wait_for` times out at 0, rolls
-  back its log entry, and never replies to c19. Client timeout.
+No third node can rescue the operation. With two nodes, the follower that is
+blocked in the forward wait is the only possible ack provider. The timeout may
+eventually free the threads, but the protocol has stopped making useful
+progress for the duration of that timeout.
 
-### The General Shape
+### Example 2
 
-Any handler that holds a local lock across a round trip can enter a
-cycle with any other node whose ack-handler needs the same local
-lock pattern. The synchronous design doesn't just starve one node —
-it couples the liveness of every pair of nodes that concurrently
-handle client traffic.
+There is a separate failure mode where the follower is not blocked at all. The
+client writes directly to the leader, the follower receives `AppendEntries`,
+and the follower sends a valid `AppendEntriesOk`. The system still stalls
+because the leader cannot process the ack it already received.
 
-## The Mental Model Shift
+Again use a two-node cluster: `n0` is leader, `n1` is follower. Client `c1`
+sends `write x=1` directly to `n0`.
 
-Treat handlers as **event-driven state transitions**, not synchronous
-RPCs. A handler's only job is:
+```mermaid
+sequenceDiagram
+    participant C as c1
+    participant L as n0 leader
+    participant F as n1 follower
+    participant A as n0 ack handler
 
-- Update local state (append to log, update term, etc.)
-- Emit outbound messages
-- Return
+    C->>L: write x=1
+    Note over L: handle_write takes n0.lock
+    L->>L: append entry i
+    L->>F: AppendEntries(i)
+    Note over L: waits for commit_index >= i<br/>while still holding n0.lock
 
-The client response is *not* the handler's job. When a `write` arrives,
-the leader:
+    Note over F: handle_append_entries takes n1.lock
+    F->>F: append entry i
+    F->>L: AppendEntriesOk(i)
 
-1. Appends the entry at index `N`.
-2. Stashes a pending-client record: `{index: N, client, msg_id}`.
-3. Returns from the handler. Replication proceeds asynchronously via
-   the existing replication loop / ack handler.
+    Note over A: handle_append_entries_ok starts
+    Note over A: cannot take n0.lock
+    Note over L,A: the ack exists, but follower_match_indexes<br/>and commit_index cannot be updated while<br/>handle_write continues holding n0.lock
+```
 
-Separately, whenever `commit_index` advances, a resolver step walks the
-newly-committed indices and, for each, sends `write_ok` to any stashed
-client. Leadership loss cancels pending records with an explicit
-`temporarily-unavailable` error, so the client retries against a
-new leader rather than waiting on a node that no longer owns the
-slot.
+The cycle is local to the leader:
 
-This also cleanly handles the "two overlapping writes" case: both land
-in the log in order, both get `write_ok` when their index commits, and
-the final value reflects the later write. Success means *durably
-committed in order*, not *value persists*.
+```mermaid
+flowchart LR
+    W["n0 handle_write<br/>waiting for commit_index >= i"]
+    A["n0 handle_append_entries_ok<br/>has AppendEntriesOk(i)"]
+    Lock["n0.lock<br/>held by handle_write"]
 
-## Why This Is the Interview Answer
+    W -- waits for ack state update --> A
+    A -- needs --> Lock
+    Lock -- not released until wait ends --> W
+```
 
-The mistake is a good story because it's a specific, concrete
-manifestation of a general lesson: **distributed protocols are defined
-by state-machine transitions over events, not by the call graph of the
-code that implements them.** Mapping protocol steps onto synchronous
-function calls felt natural coming from request/response web code, and
-it's exactly what the Raft paper's pseudocode *looks* like on first
-read — but the paper's "upon receiving…" blocks are event handlers,
-not blocking calls.
+This differs from Example 1:
 
-## Fix Summary
+- In Example 1, the follower cannot create the ack because its lock is held by
+  a forwarded client request.
+- In Example 2, the follower already created the ack. The leader prevents
+  itself from recording it.
 
-- Handlers never block on network I/O or peer responses.
-- Locks are held only for local state updates, released before any
-  wait.
-- Pending client requests are keyed by log index, resolved by the
-  commit advancement step.
-- The replication loop and ack handler are the sole drivers of
-  `matchIndex` / `commit_index` advancement.
+The observed symptom can be identical: the client waits until the replication
+timeout even though the network was healthy and the follower responded quickly.
+
+## Additional issues
+
+Blocking replication also introduces broader operational problems:
+
+1. **One slow follower stalls unrelated clients.** In a five-node cluster,
+   commit needs three replicas, not all five. A blocking helper that waits for
+   every follower makes one partitioned or slow follower impose the full
+   timeout on every write, even after a majority has already acked. The symptom
+   is p99 latency equal to the configured replication timeout.
+2. **Heartbeats and step-down are delayed.** While a leader is stuck in a
+   blocking client handler, it cannot promptly process a higher-term
+   `RequestVote` or `AppendEntries`. It may continue behaving like leader for
+   the timeout window, forwarding or accepting client work that should have
+   been rejected after step-down.
+3. **Client retries multiply the damage.** Maelstrom clients time out and retry.
+   A blocked handler may later emit an error or stale success for the original
+   attempt while the retry has already committed elsewhere. Even when safety is
+   preserved, the implementation now needs extra duplicate-response and
+   pending-request cleanup logic that the nonblocking design avoids.
+
+## Implementaiton note
+
+Do not wait for remote replication while holding the node lock, and do not make
+client response depend on the client handler remaining alive.
+
+The handler's job is local and short:
+
+1. Validate the node's current role.
+2. If leader, append the operation and remember the client message by log index.
+3. If follower with a known leader, forward the original message and return.
+4. If no leader is known, reply with `ErrorCode.TEMPORARILY_UNAVAILABLE`.
+
+After that, progress comes from protocol messages. Replication acks update
+`follower_match_indexes`; commit advancement applies the log; applying a
+committed client operation sends the reply. No handler waits for another
+handler that needs the same lock.
+
+The correct mental model is event-driven state transition, not synchronous
+RPC. "Reply to the client after commit" does not mean "block the client handler
+until commit." It means "record enough local state that a later commit event
+can produce the reply."
