@@ -94,7 +94,7 @@ A bug writeup should be concrete and reproducible. Use this section structure:
 3. `### Example <number>` - one numbered subsection per elaborate example.
 4. `## Additional issues` - document related problems that can arise but do
    not need full worked examples.
-5. `## Implementaiton note` - explain the correct implementation approach and
+5. `## Implementation note` - explain the correct implementation approach and
    the mental model to use.
 
 Prefer Mermaid diagrams for executions and dependency cycles. Sequence diagrams

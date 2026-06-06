@@ -1,0 +1,11 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -505,7 +505,6 @@ class RaftNode(Node):
+             neighbor: 0 for neighbor in self.neighbors if neighbor != self.node_id
+         }
+         self.votes = set()
+-        self.pending_replies = {}
+         self.replication_signal.set()
+ 
+     def request_vote(self):

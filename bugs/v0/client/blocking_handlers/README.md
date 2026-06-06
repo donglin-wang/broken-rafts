@@ -161,7 +161,7 @@ Blocking replication also introduces broader operational problems:
    preserved, the implementation now needs extra duplicate-response and
    pending-request cleanup logic that the nonblocking design avoids.
 
-## Implementaiton note
+## Implementation note
 
 Do not wait for remote replication while holding the node lock, and do not make
 client response depend on the client handler remaining alive.
