@@ -29,7 +29,7 @@ other handlers needed by that wait can still run." In this implementation,
 every Raft handler starts by taking the same node lock, so those other handlers
 often cannot run.
 
-The canonical v0 logic separates the concerns:
+The canonical logic separates the concerns:
 
 - `handle_write`, `handle_read`, and `handle_cas` append or forward and then
   return.

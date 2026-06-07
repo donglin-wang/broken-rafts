@@ -5,7 +5,7 @@
 This bug is a commit-index quorum calculation that counts only followers and
 forgets that the leader is also a replica.
 
-The v0 commit path is driven by `APPEND_ENTRIES_OK` replies. When a leader
+The commit path is driven by `APPEND_ENTRIES_OK` replies. When a leader
 receives a successful reply in `handle_append_entries_ok`, it updates
 `self.follower_match_indexes[src]` with the follower's `match_index`, updates
 `self.follower_next_indexes[src]`, and then calls
@@ -22,7 +22,7 @@ def commit_and_reply_if_applicable(self):
         self.commit_at(index, send_reply=True)
 ```
 
-That looks like a small change from the correct v0 implementation:
+That looks like a small change from the correct implementation:
 
 ```python
 index = median([self.record.last_index(), *self.follower_match_indexes.values()])
@@ -34,10 +34,10 @@ initialized in `become_leader()` with one entry per follower and does not contai
 `self.record.last_index()`. Omitting that value turns "majority of the cluster"
 into "majority of the followers".
 
-In a three-node v0 cluster, that is enough to break availability. A majority is
+In a three-node cluster, that is enough to break availability. A majority is
 two replicas. If leader `n1` and follower `n2` both have log index 1, index 1 is
 replicated to a quorum even if `n3` is partitioned. The buggy calculation sees
-only follower indexes `[1, 0]`; with v0's `median()` helper, that produces `0`,
+only follower indexes `[1, 0]`; with the `median()` helper, that produces `0`,
 so `n1.commit_index` never advances and the client never receives `write_ok`.
 
 The correct mental translation is:
@@ -89,7 +89,7 @@ sequenceDiagram
 At this point index 1 is safely on a majority: `n1` has it in
 `record.last_index()`, and `n2` has acknowledged it with `match_index=1`.
 
-The correct v0 calculation includes the leader:
+The correct calculation includes the leader:
 
 ```text
 median([n1.record.last_index(), n2.match_index, n3.match_index])

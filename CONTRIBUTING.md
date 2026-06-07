@@ -47,6 +47,11 @@ work well for message traces; flowcharts work well for wait-for or causality
 cycles. Keep diagrams tied to concrete node names, message types, and state
 fields from the matching canonical implementation.
 
+Bug writeups already live under versioned directories such as `bugs/v0/`.
+Avoid repeating the version in prose with phrases like "the v0 implementation"
+or "the v0 commit path" unless the version distinction is essential to the
+point being made.
+
 ## Code Conventions
 
 - Keep each canonical implementation under `src/vN/`.

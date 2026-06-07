@@ -3,7 +3,7 @@
 ## Description
 
 This bug is a one-line mistake in the leader's commit guard. In the
-correct v0 implementation, `commit_and_reply_if_applicable` computes a
+correct implementation, `commit_and_reply_if_applicable` computes a
 candidate commit index from the leader's own `record.last_index()` plus
 the follower `match_index` values reported by successful
 `append_entries_ok` messages:
@@ -113,18 +113,18 @@ sequenceDiagram
     n5->>n3: append_entries(term=5, prev_log_index=1, entries=[index 2 term 3])
 ```
 
-With the current v0 guard, `n1.record.at(2)["term"] == n1.term` is false,
+With the correct guard, `n1.record.at(2)["term"] == n1.term` is false,
 so `n1` leaves `commit_index` at 1. If index 3 later reaches a quorum,
 then the candidate index becomes 3, `record.at(3)["term"] == 4` is true,
 and `commit_at(3)` safely commits both entries together.
 
 ## Additional issues
 
-- The direct client symptom depends on `pending_replies`. In v0,
-  `become_leader` clears `pending_replies`, so an old entry inherited
-  across a leader change may be applied without a reply. That is still a
-  safety bug: `commit_index` and `snapshot` moved for an entry that could
-  later be overwritten.
+- The direct client symptom depends on `pending_replies`. Because
+  `become_leader` clears `pending_replies`, an old entry inherited across a
+  leader change may be applied without a reply. That is still a safety bug:
+  `commit_index` and `snapshot` moved for an entry that could later be
+  overwritten.
 - The bug is rare in healthy runs because a leader usually replicates a
   current-term `read`, `write`, or `cas` entry quickly. Once the median
   reaches that current-term entry, the buggy and correct guards agree.

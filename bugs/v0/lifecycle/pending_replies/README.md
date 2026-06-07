@@ -17,7 +17,7 @@ def maybe_step_down(message):
         return True
 ```
 
-In v0, client operations are not answered by the client handler. A leader
+Client operations are not answered by the client handler. A leader
 appends the operation, stores the original client message in
 `pending_replies[index]`, and returns. A later commit event applies the log
 entry and calls `reply_to_client(index, reply_body)`.
@@ -150,9 +150,9 @@ operation.
 
 ## Additional issues
 
-1. **Reads and CAS requests have the same lifecycle.** v0 logs `read`, `write`,
-   and `cas` operations. A pending read from a former leader can be answered at
-   the wrong log position just as a pending write can.
+1. **Reads and CAS requests have the same lifecycle.** The log stores `read`,
+   `write`, and `cas` operations. A pending read from a former leader can be
+   answered at the wrong log position just as a pending write can.
 2. **Forwarded client messages do not transfer ownership.** If a follower
    forwards a client request to a leader, the leader owns the pending reply
    only after it appends the request in its current term. The forwarding

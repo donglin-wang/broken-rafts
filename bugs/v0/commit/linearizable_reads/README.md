@@ -33,7 +33,7 @@ old leader, the old leader's local `state` can remain `State.LEADER`. A local
 read from `snapshot` can therefore return a value that was current in an old
 leadership epoch but stale in real time.
 
-Linearizable reads need a current-leader proof. The v0 implementation gets
+Linearizable reads need a current-leader proof. The implementation gets
 that proof by logging reads like writes: `handle_read` appends a read operation
 through `try_persist_or_forward_entry`, stores the client message in
 `pending_replies`, replicates the entry, and replies only when the entry is
@@ -166,7 +166,7 @@ real-time order clients observed.
 
 ## Implementation note
 
-For v0, make `read` a regular log operation:
+Make `read` a regular log operation:
 
 ```python
 def handle_read(message):
@@ -191,7 +191,7 @@ are visible before the response. Its majority replication establishes that the
 node was still able to act as leader for that log position.
 
 The mental model is: a read is a client-visible operation with a required
-linearization point. In v0, that point is the commit of the read's log entry.
+linearization point. Here, that point is the commit of the read's log entry.
 If you want to avoid logging reads, replace that point with an explicit
 ReadIndex-style majority heartbeat protocol, not with a direct lookup in
 `snapshot`.
