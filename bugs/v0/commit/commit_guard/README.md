@@ -1,146 +1,166 @@
-# Committing Only Current-Term Entries: §5.4.2 In The Commit Guard
+# Commit Guard Must Check The Candidate Entry Term
 
-## The Bug
+## Description
 
-In `commit_and_reply_if_applicable`, the gate on advancing
-`commit_index` was originally:
+This bug is a one-line mistake in the leader's commit guard. In the
+correct v0 implementation, `commit_and_reply_if_applicable` computes a
+candidate commit index from the leader's own `record.last_index()` plus
+the follower `match_index` values reported by successful
+`append_entries_ok` messages:
+
+```python
+def commit_and_reply_if_applicable(self):
+    if self.state != State.LEADER:
+        return
+    index = median(
+        [self.record.last_index(), *self.follower_match_indexes.values()]
+    )
+    if self.commit_index < index and self.record.at(index)["term"] == self.term:
+        self.commit_at(index, send_reply=True)
+```
+
+The buggy variant checks the term of the leader's last log entry instead
+of the term of the entry at the candidate commit index:
 
 ```python
 if self.commit_index < index and self.record.last_term() == self.term:
-    self.commit_at(index, True)
+    self.commit_at(index, send_reply=True)
 ```
 
-The right-hand condition asks the wrong question. `record.last_term()`
-is the term written next to the *most recent* entry in the leader's
-log — anywhere in the log. What §5.4.2 of the Raft paper actually
-requires is that the entry **at the index being committed by counting
-replicas** is from the leader's current term:
+`record.last_term()` answers "has this leader appended any entry in the
+current term at the tail of its log?" Raft section 5.4.2 asks a narrower
+question: "is the entry at this candidate commit index from the current
+term?" The candidate is the `index` derived from
+`follower_match_indexes`, not necessarily the leader's tail.
+
+The two checks diverge when a leader has old, uncommitted entries below a
+new current-term tail. A quorum may have replicated only the old entry.
+The buggy guard treats the current-term tail as permission to directly
+commit the old entry by counting replicas. That is unsafe: older entries
+may only become committed transitively when a current-term entry at or
+above them is committed.
+
+## Examples
+
+### Example 1
+
+Use five nodes: `n1`, `n2`, `n3`, `n4`, and `n5`. `n1` is leader in term
+4. It has an old uncommitted entry at index 2 and a newer current-term
+entry at index 3:
+
+| node | log entries after committed index 1 |
+| ---- | ----------------------------------- |
+| `n1` | index 2 term 2: `write x=1`; index 3 term 4: `write y=1` |
+| `n2` | index 2 term 2: `write x=1` |
+| `n3` | index 2 term 2: `write x=1` |
+| `n4` | no entry after index 1 |
+| `n5` | index 2 term 3: `write x=2` |
+
+From `n1`'s point of view, the relevant states are:
+
+```python
+n1.term = 4
+n1.state = State.LEADER
+n1.commit_index = 1
+n1.record.last_index() == 3
+n1.record.last_term() == 4
+n1.record.at(2)["term"] == 2
+n1.follower_match_indexes = {"n2": 2, "n3": 2, "n4": 0, "n5": 0}
+```
+
+The candidate commit index is 2:
+
+```python
+median([3, 2, 2, 0, 0]) == 2
+```
+
+The buggy guard checks the tail entry and passes:
+
+```python
+n1.record.last_term() == n1.term      # 4 == 4, true
+```
+
+So the buggy leader calls `commit_at(2, send_reply=True)`, advances
+`commit_index` to 2, and applies `write x=1` to its state machine. That
+is the wrong decision. The entry being directly committed is not from the
+leader's current term:
+
+```python
+n1.record.at(2)["term"] == n1.term    # 2 == 4, false
+```
+
+This is not just a cosmetic rule violation. If `n1` crashes before index
+3 reaches a quorum, `n5` can become leader in term 5 with its own vote
+plus votes from `n2` and `n3`. `n5` can then overwrite
+index 2 on those followers with its own term-3 entry. The `write x=1`
+operation that `n1` applied was not guaranteed to survive a leader
+change.
+
+```mermaid
+sequenceDiagram
+    participant n1 as n1 leader term=4
+    participant n2 as n2
+    participant n3 as n3
+    participant n5 as n5 future leader
+
+    Note over n1: median([3,2,2,0,0]) = 2
+    Note over n1: buggy guard uses record.last_term()==term
+    Note over n1: commit_at(2) applies write x=1
+    n1--x n2: crashes before index 3 reaches a quorum
+    n5->>n2: request_vote(term=5, last_log_term=3, last_log_index=2)
+    n2-->>n5: vote_granted=true
+    n5->>n3: request_vote(term=5, last_log_term=3, last_log_index=2)
+    n3-->>n5: vote_granted=true
+    n5->>n2: append_entries(term=5, prev_log_index=1, entries=[index 2 term 3])
+    n5->>n3: append_entries(term=5, prev_log_index=1, entries=[index 2 term 3])
+```
+
+With the current v0 guard, `n1.record.at(2)["term"] == n1.term` is false,
+so `n1` leaves `commit_index` at 1. If index 3 later reaches a quorum,
+then the candidate index becomes 3, `record.at(3)["term"] == 4` is true,
+and `commit_at(3)` safely commits both entries together.
+
+## Additional issues
+
+- The direct client symptom depends on `pending_replies`. In v0,
+  `become_leader` clears `pending_replies`, so an old entry inherited
+  across a leader change may be applied without a reply. That is still a
+  safety bug: `commit_index` and `snapshot` moved for an entry that could
+  later be overwritten.
+- The bug is rare in healthy runs because a leader usually replicates a
+  current-term `read`, `write`, or `cas` entry quickly. Once the median
+  reaches that current-term entry, the buggy and correct guards agree.
+  Partitions and leader churn stretch the window where old entries have a
+  quorum but the current-term tail does not.
+- The mistake is easy to mix up with the leader-election no-op issue. A
+  current-term tail entry is useful for eventually committing older
+  entries, but only after that current-term entry itself reaches the
+  candidate commit index.
+- A similar-looking misuse of `record.last_term()` in an election predicate
+  would be a different bug. The commit rule is about
+  `record.at(index)["term"]`; the vote up-to-date rule is about the
+  candidate and receiver last log entries.
+
+## Implementation note
+
+Keep the commit rule tied to the candidate index:
 
 ```python
 if self.commit_index < index and self.record.at(index)["term"] == self.term:
-    self.commit_at(index, True)
+    self.commit_at(index, send_reply=True)
 ```
 
-These two checks are usually equivalent, which is what lets the bug
-sit unnoticed. They diverge precisely when the leader's log holds a
-tail of current-term entries above one or more *uncommitted*
-prior-term entries — and the proposed commit index lands on one of
-the prior-term ones.
+The mental model is:
 
-## Why It Looks Reasonable
-
-`last_term() == self.term` translates intuitively to: "I have appended
-at least one entry in my current term." That feels like a sensible
-precondition for committing, and it actually *is* a sensible
-precondition for a different invariant (the no-op-on-election
-liveness fix). The mistake is using a liveness-flavored check to
-enforce a safety rule.
-
-The safety rule §5.4.2 states is narrower: don't commit *this
-specific entry* by quorum count unless *this specific entry* is from
-your term. Indices below it ride along under the Log Matching
-Property — they get committed transitively, never directly.
-
-## What Goes Wrong (Figure 8)
-
-Construct a leader L at term 5 whose log is:
-
-```
-index:  1   2   3   4   5
-term:   3   3   3   3   5
+```python
+median([self.record.last_index(), *self.follower_match_indexes.values()])
 ```
 
-Indices 1–4 were appended by an earlier term-3 leader that crashed
-before getting them to a majority. L inherited them at election time
-(its log was at least as up-to-date as the rest, so it won §5.4.1).
-L has now appended one term-5 entry at index 5.
+This finds the highest index known to be present on a quorum that
+includes the leader. Raft 5.4.2 then adds one more requirement before
+the leader may directly commit that index: the entry at that exact index
+must be from `self.term`.
 
-`record.last_term() == 5` — the buggy check passes.
-
-Now suppose L's followers have replicated through index 3 but not 4
-or 5. Median match index is 3. The buggy code reads "majority has
-index 3" and calls `commit_at(3)`. The op at index 3 is applied to
-the state machine and a `:ok` is returned to the client.
-
-L crashes before entry 5 reaches anyone. A new leader emerges whose
-log diverges from L's at index 3 — its inherited term-3 fragment was
-shorter, and the §5.4.1 chain (Figure 8 walks through the exact
-sequence in the paper) lets it win the next election. The new
-leader's log does **not** contain L's entry 3. But L told a client
-that entry 3's op committed.
-
-**Linearizability violated.** This is precisely the pattern Figure 8
-of the Raft paper exists to demonstrate.
-
-The corrected check refuses to commit index 3 (its term is 3, not 5).
-It only fires when the median reaches index 5 — at which point
-indices 1–4 commit transitively, safely, by Log Matching.
-
-## Why The Bug Is Rare In Healthy Networks
-
-Same reason as the other asynchrony-sensitive commit-path bugs:
-most of the time the window is empty.
-
-A leader at term N with a healthy network appends one term-N entry
-within milliseconds of taking office. Once that entry replicates to
-majority, the median lands on a term-N entry, and the buggy and
-correct checks agree. The divergence window is the brief interval
-between "I have prior-term entries in my log" and "I have replicated
-my first current-term entry to majority."
-
-Maelstrom's partition nemesis stretches that window: leader churn
-means more nodes inherit uncommitted prior-term tails, and the
-partition itself delays the catch-up replication that would otherwise
-close the gap.
-
-## The Right Mental Model
-
-There are two term-flavored numbers about the leader's log at any
-moment:
-
-- **`last_term()`** — the term written next to the *most recent*
-  entry in the log.
-- **`at(commit_target).term`** — the term written next to the entry
-  *being proposed for commit*.
-
-§5.4.2 talks about the second one. Nothing about the first one
-appears in the rule. Whenever a Raft commit-or-vote check needs a
-term, the question to ask is *"the term of which entry, exactly?"* —
-then read the paper clause again to find the right answer.
-
-This is the third manifestation in this codebase of the same
-underlying bug pattern, "two values that look interchangeable but
-aren't":
-
-1. **Election up-to-date check (§5.4.1):** `self.term` vs
-   `record.last_term()`.
-2. **Become-leader no-op (§5.4.2 workaround):** a related site where
-   the gap between `self.term` and `last_term()` matters.
-3. **Commit guard (§5.4.2 itself):** `record.last_term()` vs
-   `record.at(index).term` — this note.
-
-If you find yourself comparing two term-flavored numbers in a Raft
-predicate, stop and name *which entry* each term belongs to. There
-is almost always a wrong choice that compiles and runs.
-
-## The General Lesson
-
-Safety rules in Raft are stated about specific log positions, not
-about the leader's log as a whole. "An entry is safe to commit by
-counting replicas if and only if that entry is from the current
-term" — the subject of the sentence is the entry, not the leader.
-Code that translates the rule into `if leader.something == ...`
-instead of `if entry_at(index).something == ...` has dropped the
-subject and is asking a different question.
-
-The same mistake shows up elsewhere:
-
-- §5.4.1 election check ("candidate's log is at least as up-to-date
-  as receiver's log") — about the *candidate's last entry* and
-  *receiver's last entry*, not about either node's `currentTerm`.
-- AppendEntries consistency check — about the *entry at
-  `prev_log_index`* in both logs, not about either log's tail.
-
-Whenever a paper clause names two specific positions, the code has
-to name them too. Substituting "the leader's current state" for one
-of the positions is the bug.
+Older entries below it commit only as a consequence of committing the
+current-term entry. They should not be individually blessed because the
+leader has some later current-term entry in its log.
