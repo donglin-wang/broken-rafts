@@ -59,57 +59,7 @@ apply to `src/v0/`; a future `bugs/v1/` patch should apply to `src/v1/`.
 
 ## Contributing
 
-New bugs should be added as patch-backed specimens against a specific canonical
-version.
-
-1. Choose the canonical version the bug applies to, such as `v0`.
-2. Add a directory under `bugs/<version>/<subsystem>/<short_name>/`.
-3. Include:
-   - `README.md` - the explanatory writeup.
-   - `bug.patch` - the minimal patch that turns the canonical implementation
-     into the buggy implementation.
-   - `meta.toml` - metadata such as canonical version, category, title, and
-     default Maelstrom settings.
-4. Keep the patch to one logical mistake. If it touches multiple concerns,
-   split it into multiple bug specimens.
-5. Verify the patch applies:
-
-```bash
-git apply --check bugs/<version>/<subsystem>/<short_name>/bug.patch
-```
-
-6. Verify the bug reliably reproduces with Maelstrom. The default target is:
-
-```bash
-maelstrom test -w lin-kv --bin './main.py --version <version>' \
-  --time-limit 60 --node-count 3 --concurrency 4n --rate 30 \
-  --nemesis partition
-```
-
-A bug writeup should be concrete and reproducible. Use this section structure:
-
-1. `## Description` - define the bug, show the buggy code or logic, and
-   explain why it is wrong.
-2. `## Examples` - give elaborate concrete executions that expose the bug.
-3. `### Example <number>` - one numbered subsection per elaborate example.
-4. `## Additional issues` - document related problems that can arise but do
-   not need full worked examples.
-5. `## Implementation note` - explain the correct implementation approach and
-   the mental model to use.
-
-Prefer Mermaid diagrams for executions and dependency cycles. Sequence diagrams
-work well for message traces; flowcharts work well for wait-for or causality
-cycles. Keep diagrams tied to concrete node names, message types, and state
-fields from the matching canonical implementation.
-
-Code conventions:
-
-- Keep each canonical implementation under `src/vN/`.
-- Keep v0 standard-library-only.
-- Guard shared Raft state with `self.lock`.
-- Keep `Record` internal to `raft.py`.
-- Reuse existing `MessageType` values unless the bug genuinely needs a new
-  protocol message.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and agent guidance.
 
 ## Roadmap And Scope
 
