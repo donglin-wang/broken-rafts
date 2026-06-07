@@ -1,121 +1,127 @@
-# The Leader Counts: Quorum Math For `commit_index`
+# Commit Quorum Includes The Leader
 
-## The Symptom
+## Description
 
-Three-node cluster, no nemesis, low load. Throughput is fine. Now
-introduce a partition that isolates one follower. Suddenly **every**
-client write fails with `temporarily-unavailable: No leader elected`,
-or the operation simply hangs until timeout. The leader is alive,
-quorum is intact (leader + one follower = 2 of 3), but nothing
-commits.
+This bug is a commit-index quorum calculation that counts only followers and
+forgets that the leader is also a replica.
 
-## The Buggy Computation
+The v0 commit path is driven by `APPEND_ENTRIES_OK` replies. When a leader
+receives a successful reply in `handle_append_entries_ok`, it updates
+`self.follower_match_indexes[src]` with the follower's `match_index`, updates
+`self.follower_next_indexes[src]`, and then calls
+`commit_and_reply_if_applicable()`.
+
+The broken version computes the commit candidate from follower progress only:
 
 ```python
 def commit_and_reply_if_applicable(self):
-    ...
+    if self.state != State.LEADER:
+        return
     index = median(self.follower_match_indexes.values())
-    ...
+    if self.commit_index < index and self.record.at(index)["term"] == self.term:
+        self.commit_at(index, send_reply=True)
 ```
 
-`follower_match_indexes` only tracks *followers*. The leader is not
-in it. The "median" is computed over the followers' match-indexes
-alone.
-
-That sounds reasonable — "commit when the median follower has the
-entry" is a thing you might say in casual conversation about Raft.
-It is not what the protocol says.
-
-## What Raft Actually Requires
-
-Commit happens when a **majority of the cluster** (including the
-leader) has replicated the entry. The leader trivially has every
-entry it appended; that's one vote already. So the rule reduces to:
-
-> Commit index N when at least `majority(N) - 1` followers have
-> match_index ≥ N.
-
-For a 3-node cluster: `majority(3) = 2`, so we need `2 - 1 = 1`
-follower with the entry. Leader + that follower = quorum.
-
-For a 5-node cluster: need `3 - 1 = 2` followers.
-
-For a 2-node cluster: need `2 - 1 = 1` follower (i.e., both).
-
-## Cluster-Size Walkthrough
-
-Let `n = total nodes`, `f = followers = n-1`. The threshold I want
-to extract from the sorted follower match-indexes is the
-`(majority(n) - 1)`-th-largest. Equivalently in ascending order, the
-element at index `f - (majority(n) - 1) = f - majority(n) + 1`.
-
-If you instead compute `majority(f)` and pull `f - majority(f)`-th
-element (the buggy code), you get:
-
-| n | f | majority(n)-1 | majority(f) | buggy threshold demands | needs |
-|---|---|---|---|---|---|
-| 2 | 1 | 1 | 1 | 1 of 1 followers | 1 of 1 ✓ |
-| 3 | 2 | 1 | 2 | **2 of 2** followers | 1 of 2 |
-| 4 | 3 | 2 | 2 | 2 of 3 followers | 2 of 3 ✓ |
-| 5 | 4 | 2 | 3 | **3 of 4** followers | 2 of 4 |
-
-The bug is benign for even `n` (4 and 6 happen to coincide) but
-catastrophic for odd `n` — including the most common Maelstrom
-configuration of 3 nodes, where it demands *unanimity* instead of a
-majority. With one follower partitioned away, a 3-node cluster's
-buggy leader can never commit anything.
-
-This is exactly why availability collapses under partition: a single
-slow or partitioned follower out of two gates *every* write. The
-healthy follower acks promptly; the leader sits on its hands waiting
-for the dead one. The broader principle is: phrase the condition as
-a count over a quorum, not a conjunction over a specific set.
-
-## Why It's Easy To Miss
-
-The Raft paper's commit rule is stated in terms of "a majority of
-matchIndex[i] ≥ N." Reading that quickly, "majority of matchIndex"
-gets parsed as "majority of the dict I called matchIndex" — and that
-dict, in most implementations, only contains followers. The leader's
-own progress is implicit and gets dropped on the floor.
-
-The fix is to either:
-
-1. Include the leader's `last_index()` in the input to the median.
-2. Special-case the leader and require `majority(n) - 1` followers
-   to be at or above the candidate index.
-
-Option (1) is one line and works for all `n`. The whole point is
-that the median operates over *the cluster*, not over the followers
-dict.
-
-## A Smaller Trap Inside The Same Calculation
-
-Even with the leader added, there's a second subtlety: the candidate
-index N must be from the **current term** before it's eligible to
-commit (§5.4.2). The check looks something like:
+That looks like a small change from the correct v0 implementation:
 
 ```python
-if self.commit_index < index and self.record.last_term() == self.term:
-    self.commit_at(index, True)
+index = median([self.record.last_index(), *self.follower_match_indexes.values()])
 ```
 
-`last_term() == self.term` is a coarse approximation of "the entry at
-N is from the current term." It's correct as long as nothing in
-between is from an earlier term, which is true for an append-only
-leader, but the *reason* the check exists is the §5.4.2 rule, not
-"last term equals current term." If you ever change how the log can
-be edited (e.g., snapshots), come back here and re-derive.
+but it changes the quorum being measured. `self.follower_match_indexes` is
+initialized in `become_leader()` with one entry per follower and does not contain
+`self.node_id`. The leader's own log position is represented by
+`self.record.last_index()`. Omitting that value turns "majority of the cluster"
+into "majority of the followers".
 
-## The Mental Model
+In a three-node v0 cluster, that is enough to break availability. A majority is
+two replicas. If leader `n1` and follower `n2` both have log index 1, index 1 is
+replicated to a quorum even if `n3` is partitioned. The buggy calculation sees
+only follower indexes `[1, 0]`; with v0's `median()` helper, that produces `0`,
+so `n1.commit_index` never advances and the client never receives `write_ok`.
 
-The committed prefix of the log is the prefix that will survive any
-future leader change. "Survival" requires that any future leader had
-the entry when it was elected. By the election restriction (§5.4.1),
-a leader's log includes everything from any majority that voted for
-it. So commit = "a majority has it" = "no future leader can be
-elected without it."
+The correct mental translation is:
 
-The leader is a participant in that majority, not a referee on the
-sidelines counting the others. Treating it as the latter is the
-specific logic error in this bug.
+```text
+commit index N when the leader plus enough followers have N
+```
+
+not:
+
+```text
+commit index N when enough followers have N
+```
+
+## Example
+
+Three nodes are initialized as `n1`, `n2`, and `n3`. `n1` is leader in term 1.
+Its leader state is:
+
+```text
+n1.state = State.LEADER
+n1.term = 1
+n1.commit_index = 0
+n1.record.last_index() = 0
+n1.follower_match_indexes = {"n2": 0, "n3": 0}
+```
+
+A client sends a `write` to `n1`. `try_persist_or_forward_entry()` appends a
+term-1 entry at index 1, stores the client message in
+`pending_replies[1]`, and wakes the replication loop.
+
+Now partition `n3` away from `n1`, while `n1` can still talk to `n2`.
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant N1 as n1 leader
+    participant N2 as n2 follower
+    participant N3 as n3 follower
+
+    C->>N1: write key=x value=1
+    Note over N1: record.last_index() = 1<br/>pending_replies[1] = write
+    N1->>N2: APPEND_ENTRIES term=1 entries=[index 1] leader_commit=0
+    N1-xN3: APPEND_ENTRIES term=1 entries=[index 1] leader_commit=0
+    N2->>N1: APPEND_ENTRIES_OK success=true match_index=1
+    Note over N1: follower_match_indexes = {"n2": 1, "n3": 0}
+```
+
+At this point index 1 is safely on a majority: `n1` has it in
+`record.last_index()`, and `n2` has acknowledged it with `match_index=1`.
+
+The correct v0 calculation includes the leader:
+
+```text
+median([n1.record.last_index(), n2.match_index, n3.match_index])
+median([1, 1, 0]) = 1
+```
+
+Because `record.at(1)["term"] == n1.term`, `n1` calls
+`commit_at(1, send_reply=True)`, applies the `write` to `snapshot`, advances
+`commit_index` to 1, and sends `write_ok` to the client from
+`reply_to_client(1, ...)`.
+
+The buggy calculation excludes the leader:
+
+```text
+median([n2.match_index, n3.match_index])
+median([1, 0]) = 0
+```
+
+`n1.commit_index < 0` is false, so `commit_at()` is not called. The client write
+remains in `pending_replies[1]` even though a real Raft quorum has the entry.
+With Maelstrom's usual three-node `lin-kv` partition test, this presents as
+writes hanging or later operations being rejected with
+`temporarily-unavailable` after leadership churn.
+
+## Additional issues
+
+- The failure also delays follower application. Followers only learn the
+  leader's commit point through the `leader_commit` field on later
+  `APPEND_ENTRIES` messages. If the leader's own `commit_index` is stuck at 0,
+  it keeps sending `leader_commit=0`, so healthy followers that already have the
+  entry do not apply it to `snapshot` either.
+- The same mistake can be hidden by test topology. A two-node cluster really
+  does need the one follower. A four-node cluster needs two of three followers,
+  which is exactly what the follower-only median happens to demand. Testing only
+  those sizes can miss the bug.

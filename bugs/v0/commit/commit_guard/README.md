@@ -40,9 +40,7 @@ commit the old entry by counting replicas. That is unsafe: older entries
 may only become committed transitively when a current-term entry at or
 above them is committed.
 
-## Examples
-
-### Example 1
+## Example
 
 Use five nodes: `n1`, `n2`, `n3`, `n4`, and `n5`. `n1` is leader in term
 4. It has an old uncommitted entry at index 2 and a newer current-term

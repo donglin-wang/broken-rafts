@@ -21,8 +21,8 @@ def handle_read(message):
             self.forward(self.leader, message)
 ```
 
-That code looks reasonable if `snapshot` contains only committed log entries.
-It is still wrong. A committed prefix on one node is not proof that the node is
+This code looks reasonable given that `snapshot` contains only committed log entries.
+However, it is not correct. A committed prefix on one node is not proof that the node is
 still the current leader, and it is not proof that no newer committed operation
 exists on a majority the node can no longer reach.
 

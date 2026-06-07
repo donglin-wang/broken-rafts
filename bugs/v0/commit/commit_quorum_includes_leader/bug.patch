@@ -1,0 +1,15 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..d53789a 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -387,9 +387,7 @@ class RaftNode(Node):
+     def commit_and_reply_if_applicable(self):
+         if self.state != State.LEADER:
+             return
+-        index = median(
+-            [self.record.last_index(), *self.follower_match_indexes.values()]
+-        )
++        index = median(self.follower_match_indexes.values())
+         if self.commit_index < index and self.record.at(index)["term"] == self.term:
+             self.commit_at(index, send_reply=True)
+ 
