@@ -1,0 +1,12 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..c8f18a7 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -354,7 +354,6 @@ class RaftNode(Node):
+                     and self.state != State.LEADER
+                 ):
+                     self.trigger_election()
+-            time.sleep(ELECTION_TICK_S)
+ 
+     def replication_loop(self):
+         while True:

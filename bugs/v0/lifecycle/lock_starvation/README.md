@@ -1,54 +1,100 @@
-# Lock Starvation from a Tight Loop
+# Lock Starvation from a Tight Election Loop
 
-A thread that re-acquires a lock immediately after releasing it can starve other waiting threads, even though the lock is technically "released" between iterations.
+## Description
 
-## Minimal Example
-
-```python
-import threading
-import time
-
-lock = threading.Lock()
-handled = False
-
-def tight_loop():
-    while True:
-        with lock:
-            pass  # releases lock, but immediately re-acquires it
-
-def handler():
-    global handled
-    with lock:      # starved — can rarely win the race
-        handled = True
-
-t1 = threading.Thread(target=tight_loop, daemon=True)
-t1.start()
-
-time.sleep(0.01)
-
-t2 = threading.Thread(target=handler)
-t2.start()
-t2.join(timeout=1)
-
-print("handled:", handled)  # often False
-```
-
-## Why It Happens
-
-When `tight_loop` exits the `with` block, CPython releases the lock and immediately tries to re-acquire it in the next iteration. The OS may not get a chance to schedule `handler` before `tight_loop` wins the lock again. `handler` is left waiting indefinitely.
-
-## Fix
-
-Release the lock *and* yield the CPU between iterations:
+The bug is turning the election background thread into a tight loop that
+releases `self.lock` and immediately tries to take it again:
 
 ```python
-def loop_with_sleep():
+def election_loop(self):
     while True:
-        with lock:
-            pass
-        time.sleep(0.01)  # outside the lock — lets other threads run
+        with self.lock:
+            if (
+                datetime.now() > self.election_deadline
+                and self.state != State.LEADER
+            ):
+                self.trigger_election()
 ```
 
-## In the Raft Context
+The canonical loop sleeps after the `with self.lock` block:
 
-`election_loop` was the tight loop. `handle_request_vote` was the starved handler. Even with randomized election timeouts, nodes triggered elections faster than vote requests could be processed, so every node voted for itself before seeing any peer's `REQUEST_VOTE`.
+```python
+def election_loop(self):
+    while True:
+        with self.lock:
+            if (
+                datetime.now() > self.election_deadline
+                and self.state != State.LEADER
+            ):
+                self.trigger_election()
+        time.sleep(ELECTION_TICK_S)
+```
+
+That sleep is outside the lock on purpose. It yields the CPU between election
+checks, giving message-handler threads a chance to acquire the same node lock.
+
+Without the sleep, `election_loop` can win the lock again and again between
+iterations. The lock is technically released, but in practice handlers such as
+`handle_request_vote`, `handle_append_entries`, and `handle_request_vote_ok`
+may wait behind the background loop long enough for the node to stop making
+Raft progress.
+
+## Example
+
+Three-node cluster: `n0, n1, n2`. There is no leader yet, and each node's
+election loop is spinning without `time.sleep(ELECTION_TICK_S)`.
+
+```mermaid
+sequenceDiagram
+    participant N0 as n0 election_loop
+    participant H0 as n0 request handler
+    participant N1 as n1 candidate
+    participant N2 as n2 candidate
+
+    Note over N0: takes n0.lock
+    Note over N0: election deadline has expired
+    N0->>N1: RequestVote(term=1)
+    N0->>N2: RequestVote(term=1)
+    Note over N0: releases n0.lock
+    Note over N0: immediately tries to reacquire n0.lock
+
+    N1->>H0: RequestVote(term=1)
+    Note over H0: handle_request_vote waits for n0.lock
+    N2->>H0: RequestVote(term=1)
+    Note over H0: still waiting for n0.lock
+
+    Note over N0: reacquires n0.lock before handlers run
+    Note over N0: repeats the loop without yielding
+```
+
+The stalled dependency is local to each node:
+
+```mermaid
+flowchart LR
+    Loop["election_loop<br/>reacquires self.lock"]
+    Handler["handle_request_vote<br/>needs self.lock"]
+    Vote["peer candidate<br/>waits for vote response"]
+
+    Loop -- starves --> Handler
+    Handler -- cannot reply to --> Vote
+    Vote -- times out and starts another election --> Loop
+```
+
+Randomized election deadlines do not solve this bug. Once a node's election
+thread is spinning, incoming vote and heartbeat messages still need the same
+lock to reset the deadline, grant votes, step down, or accept a leader. If
+those handlers cannot run promptly, candidates keep timing out and starting new
+terms instead of converging on a leader.
+
+## Implementation Note
+
+Background loops that hold a shared node lock should do short local work, leave
+the critical section, and then wait outside the lock. The wait can be a sleep,
+an event wait, or another blocking primitive, but it must happen after releasing
+`self.lock`.
+
+For this election loop, the correct yield is `time.sleep(ELECTION_TICK_S)`
+outside the `with self.lock` block. Moving the sleep inside the critical
+section would avoid the tight CPU loop but would still block message handlers
+while the node is sleeping, so it is a different lock-liveness bug rather than
+a fix.

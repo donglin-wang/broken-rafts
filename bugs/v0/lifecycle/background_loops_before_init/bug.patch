@@ -1,0 +1,24 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..1d1e917 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -147,6 +147,10 @@ class RaftNode(Node):
+         }
+ 
+         self.replication_signal = threading.Event()
++        self.background_tasks = [
++            threading.Thread(target=self.election_loop, daemon=True),
++            threading.Thread(target=self.replication_loop, daemon=True),
++        ]
+ 
+         self.snapshot: dict[str, Any] = {}
+         self.pending_replies: dict[int, Message[Any]] = {}
+@@ -164,8 +168,6 @@ class RaftNode(Node):
+                     "in_reply_to": reply_id(message),
+                 },
+             )
+-            threading.Thread(target=self.election_loop, daemon=True).start()
+-            threading.Thread(target=self.replication_loop, daemon=True).start()
+ 
+     def handle_append_entries(self, message: Message[AppendEntriesBody]):
+         with self.lock:

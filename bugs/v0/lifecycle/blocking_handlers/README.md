@@ -49,6 +49,7 @@ A two-node cluster is enough to break the blocking design. The cluster is
 Client `c1` sends `write x=1` to follower `n1`.
 
 ```mermaid
+%%{init: {"sequence": {"actorMargin": 105}}}%%
 sequenceDiagram
     participant C as c1
     participant F as n1 follower

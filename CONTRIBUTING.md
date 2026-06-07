@@ -9,8 +9,6 @@ version.
    - `README.md` - the explanatory writeup.
    - `bug.patch` - the minimal patch that turns the canonical implementation
      into the buggy implementation.
-   - `meta.toml` - metadata such as canonical version, category, title, and
-     default Maelstrom settings.
 4. Keep the patch to one logical mistake. If it touches multiple concerns,
    split it into multiple bug specimens.
 5. Verify the patch applies:
