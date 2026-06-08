@@ -1,161 +1,202 @@
-# Match-Index Updates: What An Ack Actually Acknowledges
+# Match Index Must Come From The Acked Range
 
-## The Bug
+## Description
 
-When an `AppendEntriesOk` arrives with `success=true`, the obvious-looking
-update is:
-
-```python
-self.follower_match_indexes[src] = self.record.last_index()
-self.follower_next_indexes[src] = self.record.next_index()
-```
-
-This is wrong. It treats the response as if it acknowledges *the leader's
-current log*, when what it actually acknowledges is *the specific range
-the leader sent in the request that produced this response*. Those two
-values are equal only in the degenerate single-in-flight case.
-
-## Why It Looks Reasonable
-
-The Raft paper's pseudocode reads almost like RPC:
-
-> If successful: update nextIndex and matchIndex for follower (§5.3)
-
-If you mentally model this as a synchronous RPC — "I called
-AppendEntries, it returned success, therefore it has my whole log now" —
-then `match_index = last_index()` looks right. The follower successfully
-applied the entries; the leader's `last_index()` is what those entries
-ended at; QED.
-
-The trap is that "the entries" in that sentence refers to the entries
-that were in the request, not the entries in the leader's log *now*.
-The leader is free to append new entries in between sending and
-receiving.
-
-## The Asynchrony You Forgot
-
-Two things happen concurrently:
-
-1. The replication loop fires every 100ms, sending AppendEntries.
-2. Client write handlers append new entries to the leader's log
-   whenever a write arrives.
-
-Between any two ticks of the replication loop, an arbitrary number of
-new entries can be appended. If a `RequestVote` reply lands during that
-window, it is acknowledging a *snapshot* of the log that no longer
-matches `record.last_index()`.
-
-## A Trace That Goes Unsafe
-
-Three-node cluster: leader L, followers F1, F2.
-
-**T=0** — L's log is `[1,2,3,4,5]`. Replication loop fires; L sends
-F1 an `AppendEntries` carrying entries 4..5 (assume next_index=4).
-
-**T=10ms** — Client write arrives. L appends entry 6, log is now
-`[1..6]`. `last_index() = 6`.
-
-**T=15ms** — F1's ack for the T=0 AppendEntries arrives at L. F1
-applied entries 4..5 successfully. F1's log is `[1..5]`.
-
-**T=15ms** — Buggy update fires:
+This bug is an unsafe update in `handle_append_entries_ok`.
+After receiving a successful `AppendEntriesOk`, the buggy leader records that
+the follower has the leader's current log tail:
 
 ```python
-self.follower_match_indexes["F1"] = self.record.last_index()   # = 6
+if body["success"] is True:
+    self.follower_match_indexes[src] = self.record.last_index()
+    self.follower_next_indexes[src] = self.record.next_index()
 ```
 
-L now believes F1 has entry 6. F1 does not have entry 6.
+That treats the reply as evidence about `self.record` at receive time. A
+successful `AppendEntriesOk` only acknowledges the `entries` range carried by
+the specific `AppendEntries` request that produced the reply. The leader may
+have appended more log entries after sending that request and before handling
+the reply, so `self.record.last_index()` can be ahead of anything the follower
+has accepted.
 
-**T=20ms** — Suppose F2's match_index is also 6 (by the same bug, or
-by genuine replication catching up). Median of `[6, 6]` is 6. L
-commits index 6.
+The canonical implementation makes the acknowledged range explicit. The leader
+sends:
 
-**T=25ms** — L crashes before sending entry 6 in any subsequent
-AppendEntries.
-
-**T=2s** — F1 and F2 hold an election. Their last log entry is
-index 5, term whatever. The new leader's log does **not** contain
-entry 6. But L told its client `write_ok` for entry 6 because L
-committed it.
-
-**Linearizability violated.** A client received `ok` for an operation
-that no quorum ever stored.
-
-In Maelstrom this manifests as the Knossos checker rejecting the
-history with a "can't reach this state" message, often around CAS
-operations whose preconditions depend on an entry that "committed" but
-isn't really there.
-
-## Why The Cluster Doesn't Always Catch You
-
-The cluster *does* eventually correct itself most of the time:
-
-- The next replication tick sends entry 6 to F1.
-- F1 acks. The mistaken match_index of 6 happens to become true
-  retroactively.
-- The leader doesn't notice it was briefly wrong.
-
-This is what makes the bug so insidious. The match_index "lies" for
-~100ms-ish before truth catches up. In a healthy network you can run
-millions of operations and never see it. The window only widens
-under:
-
-- A burst of writes between replication ticks (100ms is a long time at
-  high write rate).
-- A leader crash inside that window.
-- A network partition that delays the catch-up replication.
-
-Maelstrom's partition nemesis manufactures exactly those conditions,
-which is why the bug is far more visible there than in steady-state.
-
-## The Right Mental Model
-
-An `AppendEntriesOk` carries no payload describing *what* it
-acknowledges. The leader has to reconstruct that from the request that
-elicited the response — and the leader is the one that sent the
-request, so it knew the answer at send time.
-
-There are two correct approaches:
-
-1. **Stamp the request.** Include `prev_log_index` and `len(entries)`
-   in the AppendEntries; on success, set
-   `match_index = prev_log_index + len(entries)`.
-2. **Echo it back.** The follower repeats `prev_log_index` and the
-   number of entries it accepted in the response; the leader uses
-   those.
-
-Either way, the source of truth is the *range that was negotiated by
-that specific request/response pair*, not a global property of the
-leader's current state.
-
-A subtler version: if you *do* echo back, you also have to ignore
-acks that arrive out of order. An old, in-flight ack saying "I have
-through index 5" must not overwrite a more recent ack of "I have
-through index 8" — match_index is monotonic from the leader's
-perspective. The cleanest way is to take the max:
-
-```
-match_index[src] = max(match_index[src], acked_through)
+```python
+payload: AppendEntriesBody = {
+    "type": MessageType.APPEND_ENTRIES,
+    "term": self.term,
+    "leader_id": self.node_id,
+    "prev_log_term": prev_entry["term"],
+    "prev_log_index": prev_log_index,
+    "entries": self.record.slice_from(follower_next_index),
+    "leader_commit": self.commit_index,
+}
 ```
 
-## The General Lesson
+On success, the follower replies with the last index covered by that request:
 
-Asynchronous protocol responses are about the request that produced
-them, not about the responder's or sender's *current* state. If your
-code resolves a response by reading global state instead of inspecting
-the request/response pair, you have introduced an implicit assumption
-that nothing else moved between send and receive. That assumption is
-false in any system worth building.
+```python
+self.send(
+    message["src"],
+    {
+        "type": MessageType.APPEND_ENTRIES_OK,
+        "in_reply_to": reply_id(message),
+        "term": self.term,
+        "success": True,
+        "match_index": prev_log_index + len(entries),
+    },
+)
+```
 
-The same issue shows up in:
+The leader must update replication progress from that `match_index`, not from
+its current local tail:
 
-- HTTP retries replaying a stale request body against a moved-on server.
-- Cache-invalidation messages whose payload describes "what was true
-  when I sent this," not "what is true now."
-- Database two-phase commit where the coordinator's notion of the
-  transaction state must be derived from the prepare/commit messages
-  themselves, not from current row state.
+```python
+if body["success"] is True:
+    self.follower_match_indexes[src] = max(
+        body["match_index"], self.follower_match_indexes[src]
+    )
+    self.follower_next_indexes[src] = max(
+        body["match_index"] + 1,
+        self.follower_next_indexes[src],
+    )
+```
 
-Whenever you write `state[remote] = local_state` in response to a
-remote message, ask: *did the remote acknowledge `local_state`, or
-did it acknowledge whatever local_state was at send time?*
+The `max(...)` calls also preserve monotonicity when older successful replies
+arrive after newer ones.
+
+## Example
+
+```mermaid
+sequenceDiagram
+    participant c as client
+    participant n0 as n0 leader
+    participant n1 as n1 follower
+    participant n2 as n2 follower
+
+    n0->>n1: AppendEntries(prev_log_index=3, entries=[4,5])
+    c->>n0: write x=1 appends entry 6
+    n1-->>n0: AppendEntriesOk(success=true, match_index=5)
+    Note over n0: buggy update records n1 match_index=6
+    Note over n0: median([6,6,0]) = 6
+    n0-->>c: WriteOk after commit_at(6)
+    c->>n0: read x
+    n0-->>c: ReadOk(x=1)
+    n0--x n1: partitions before entry 6 replicates
+    n0--x n2: partitions before entry 6 replicates
+    n1->>n2: RequestVote(last_log_index=5)
+    n2-->>n1: RequestVoteOk(vote_granted=true)
+    Note over n1,n2: n1 is now leader, quorum log stops before entry 6
+    c->>n1: read x
+    n1-->>c: ReadOk(x=0)
+```
+
+Suppose we have three nodes: `n0`, `n1`, and `n2`. `n0` is leader in the
+current term. All nodes have entries through index 3, and `n0` has already sent
+an `AppendEntries` to `n1` for entries 4 and 5:
+
+```python
+n0.record.last_index() == 5
+n0.follower_next_indexes["n1"] == 4
+```
+
+The in-flight request to `n1` has this logical range:
+
+```python
+AppendEntries {
+    prev_log_index: 3,
+    entries: [entry_4, entry_5],
+}
+```
+
+Before `n1`'s reply reaches `n0`, a client write arrives at the leader. Suppose
+it writes `x = 1`, and the previous committed value of `x` was `0`. The leader
+appends entry 6:
+
+```python
+n0.record.last_index() == 6
+```
+
+`n1` then handles the older `AppendEntries`, accepts only entries 4 and 5, and
+replies successfully:
+
+```python
+AppendEntriesOk {
+    success: True,
+    match_index: 5,
+}
+```
+
+With the buggy update, `n0` ignores the acknowledged range and records its
+current tail instead:
+
+```python
+n0.follower_match_indexes["n1"] = n0.record.last_index()  # 6
+n0.follower_next_indexes["n1"] = n0.record.next_index()   # 7
+```
+
+Now `n0` believes `n1` has entry 6, but `n1` only has entries through index 5.
+That false progress can immediately advance the commit index. In a three-node
+cluster, the commit candidate is the median of the leader's own
+`record.last_index()` and the follower `match_index` values:
+
+```python
+median([n0.record.last_index(), *n0.follower_match_indexes.values()])
+```
+
+If `n2` is still behind, the buggy state can still produce a candidate of 6:
+
+```python
+n0.record.last_index() == 6
+n0.follower_match_indexes == {"n1": 6, "n2": 0}
+median([6, 6, 0]) == 6
+```
+
+If entry 6 is from `n0.term`, `commit_and_reply_if_applicable` passes the
+current-term guard and calls `commit_at(6, send_reply=True)`. The leader applies
+entry 6 and can reply `WriteOk`, `ReadOk`, or `CasOk` to the waiting client even
+though no follower actually stores entry 6.
+
+The safety break becomes visible if `n0` is partitioned away before a later
+replication sends entry 6 to either follower. `n1` and `n2` can elect a leader
+whose log stops before entry 6. The client has already observed `WriteOk` for
+`x = 1`, and may also have observed a `ReadOk` returning `x = 1` from `n0`.
+After the election, the same client can read from the new leader and observe the
+older value `x = 0`. That history cannot be linearized because the successful
+write disappeared after it had already been observed.
+
+This does not fail on every run because a later replication round may send
+entry 6 to `n1` before leadership changes. The mistaken `match_index` is then
+made true after the fact. Maelstrom's partition nemesis widens the vulnerable
+window by delaying messages, triggering leader churn, and cutting off the
+catch-up replication that would otherwise hide the bug.
+
+## Implementation Note
+
+Do not derive follower progress from the leader's current log in an
+`AppendEntriesOk` handler. The progress value must come from the request/reply
+pair:
+
+- The leader can stamp the request and remember `prev_log_index + len(entries)`
+  for the corresponding `in_reply_to`.
+- The follower can echo the accepted range back, as the canonical code does
+  with `match_index = prev_log_index + len(entries)`.
+
+Either way, update `follower_match_indexes[src]` and
+`follower_next_indexes[src]` monotonically:
+
+```python
+self.follower_match_indexes[src] = max(
+    body["match_index"], self.follower_match_indexes[src]
+)
+self.follower_next_indexes[src] = max(
+    body["match_index"] + 1,
+    self.follower_next_indexes[src],
+)
+```
+
+An `AppendEntriesOk` response is a fact about one completed
+`AppendEntries` request. It is not a promise that the follower has whatever
+the leader's `record.last_index()` happens to be when the response is finally
+processed.

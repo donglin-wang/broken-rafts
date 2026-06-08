@@ -1,0 +1,20 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..39ecad7 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -241,13 +241,8 @@ class RaftNode(Node):
+             src = message["src"]
+             body = message["body"]
+             if body["success"] is True:
+-                self.follower_match_indexes[src] = max(
+-                    body["match_index"], self.follower_match_indexes[src]
+-                )
+-                self.follower_next_indexes[src] = max(
+-                    body["match_index"] + 1,
+-                    self.follower_next_indexes[src],
+-                )
++                self.follower_match_indexes[src] = self.record.last_index()
++                self.follower_next_indexes[src] = self.record.next_index()
+             else:
+                 self.follower_next_indexes[src] = min(
+                     self.follower_next_indexes[src],
