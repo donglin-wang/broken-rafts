@@ -1,0 +1,26 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..daa4c12 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -172,6 +172,10 @@ class RaftNode(Node):
+             self.log(f"Appending entries: {message}")
+             incoming_term = message["body"]["term"]
+ 
++            self.reset_deadline()
++            self.maybe_step_down(message)
++            self.maybe_accept_leader(message)
++
+             if incoming_term < self.term:
+                 self.send(
+                     message["src"],
+@@ -186,10 +190,6 @@ class RaftNode(Node):
+                 )
+                 return
+ 
+-            self.reset_deadline()
+-            self.maybe_step_down(message)
+-            self.maybe_accept_leader(message)
+-
+             prev_log_index = message["body"]["prev_log_index"]
+             prev_log_term = message["body"]["prev_log_term"]
+ 

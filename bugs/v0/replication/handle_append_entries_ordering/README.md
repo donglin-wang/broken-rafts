@@ -1,179 +1,154 @@
 # Reject First, Update State Second
 
-## The Bug
+## Description
 
-`handle_append_entries` does work in the wrong order:
-
-```python
-def handle_append_entries(self, message):
-    incoming_term = message["body"]["term"]
-    self.election_deadline = (...)                 # line 163
-    self.become_follower_if_applicable(message)    # line 166
-    if incoming_term < self.term:
-        return reject                              # line 171
-    ...
-```
-
-The election deadline is bumped and `become_follower_if_applicable`
-is run **before** the stale-term check. A delayed AppendEntries from
-a dead older-term leader still:
-
-1. Pushes the receiver's election deadline out (compounding any
-   `+=` drift in deadline arithmetic).
-2. Runs through `become_follower_if_applicable`, which inspects the
-   message's `leader_id` field and overwrites `self.leader` —
-   pointing the node at a leader the cluster has already moved past.
-
-Only then does the term check fire and reject the message. By that
-point the side effects have already happened.
-
-The fix is the canonical RPC handler logic: reject by term first,
-*then* mutate state.
+`handle_append_entries` must reject a stale-term `AppendEntries` before it
+updates any local state. The canonical handler does that by checking
+`incoming_term < self.term` immediately after reading the message term:
 
 ```python
-def handle_append_entries(self, message):
-    incoming_term = message["body"]["term"]
-    if incoming_term < self.term:
-        return reject
-    self.become_follower_if_applicable(message)
-    self.election_deadline = (...)
-    ...
+incoming_term = message["body"]["term"]
+
+if incoming_term < self.term:
+    self.send(
+        message["src"],
+        {
+            "type": MessageType.APPEND_ENTRIES_OK,
+            "in_reply_to": reply_id(message),
+            "term": self.term,
+            "success": False,
+            "leader_id": self.leader,
+            "prev_log_index": message["body"]["prev_log_index"],
+        },
+    )
+    return
+
+self.reset_deadline()
+self.maybe_step_down(message)
+self.maybe_accept_leader(message)
 ```
 
-## Why It Looks Reasonable
+The bug moves the state updates above the stale-term check:
 
-"Reset the election deadline when you receive an AppendEntries" is
-one of the standard election-timer reset obligations, and
-`become_follower_if_applicable` is the standard step-down hook that
-fires on any incoming message. Putting both at the top of
-`handle_append_entries` reads as "do the universal bookkeeping
-before getting into the message-specific logic."
+```python
+incoming_term = message["body"]["term"]
 
-The trap is that "universal bookkeeping" is universal only with
-respect to *valid* messages. A stale-term AE is not evidence that
-the cluster has a live leader, is not evidence that any election
-should be postponed, is not evidence about who the current leader
-is. It is evidence that some node has fallen behind. The right
-response is to ignore it; the wrong response is to update local
-state on the assumption that the message is current.
+self.reset_deadline()
+self.maybe_step_down(message)
+self.maybe_accept_leader(message)
 
-§5.1 of the Raft paper states the rule universally: *"if a server
-receives a request with a stale term number, it rejects the
-request."* Every other side effect in the handler is gated on the
-message being non-stale.
+if incoming_term < self.term:
+    self.send(...)
+    return
+```
 
-## A Trace That Goes Unsafe
+That order is wrong because a stale `AppendEntries` is not evidence that the
+cluster has a live current leader. A delayed message such as
+`AppendEntries{term=2, leader_id="n1", ...}` arriving at a node whose
+`self.term` is already 5 should be rejected by sending
+`MessageType.APPEND_ENTRIES_OK` with `success=False`; it should not reset
+`self.election_deadline`.
 
-Five-node cluster: healthy leader L at term 5. Long-isolated node X
-that thinks it is leader at term 2. Followers F1, F2, F3.
+`reset_deadline()` is a side effect of accepting a non-stale leader message. If
+it runs before the term guard, an obsolete leader can still act as a false
+liveness signal. `maybe_step_down(message)` and `maybe_accept_leader(message)`
+are also acceptance-path bookkeeping and belong after the same guard. In the
+canonical code, those helpers do not change state for a lower-term
+`AppendEntries`. `maybe_step_down()` only reacts to higher terms or same-term
+candidate step-downs, and `maybe_accept_leader()` requires
+`message["body"]["term"] >= self.term`. Keeping all three calls below the
+stale-term check makes that invariant explicit at the handler boundary.
 
-**T=0** — Partition heals. X reconnects.
+The key rule is the one Raft applies to every RPC term: inspect the term first,
+then mutate state only for a message that belongs to the current or a newer
+term.
 
-**T=10ms** — X's stale replication loop fires. X sends
-`AppendEntries{term=2, leader_id=X, ...}` to F1.
+## Example
 
-**T=11ms** — F1 (at term 5, follower of L) processes the message:
+Three-node cluster: current leader `n0` is in term 5. Follower `n1` also has
+`self.term == 5` and `self.leader == "n0"`. Node `n2` was isolated long enough
+that it still believes it is leader in term 2.
 
-- `self.election_deadline = datetime.now() + timeout`. F1's deadline
-  was about to fire — it's now pushed 750ms further out.
-- `become_follower_if_applicable(msg)`: `incoming_term (2) > self.term
-  (5)` is false, so no step-down. But the early `leader_id` branch
-  fires: `if "leader_id" in body and body["leader_id"] is not None`
-  → `self.leader = X`. F1 now believes X is the leader.
-- `incoming_term < self.term` → reject. Reply false.
+```mermaid
+sequenceDiagram
+    participant N2 as n2 stale leader, term 2
+    participant N1 as n1 follower, term 5
+    participant N0 as n0 current leader, term 5
 
-F1 has just adopted the dead leader's identity as its current leader,
-*and* postponed its election deadline. From F1's perspective:
+    Note over N2: Replication loop still believes n2 is leader
+    N2->>N1: AppendEntries(term=2, leader_id=n2, prev_log_index=..., entries=...)
+    Note over N1: Buggy order runs side effects before stale-term rejection
+    N1->>N1: reset_deadline()
+    N1->>N1: maybe_step_down(message) and maybe_accept_leader(message)
+    N1-->>N2: AppendEntriesOk(term=5, success=false, leader_id=..., prev_log_index=...)
+    N0->>N1: AppendEntries(term=5, leader_id=n0, ...)
+```
 
-- A client write arriving at F1 will be forwarded to X — a dead-end.
-- L's next heartbeat will eventually correct `self.leader` back to L,
-  but the window between T=11ms and L's next tick (up to ~100ms here)
-  is a black-hole for any traffic F1 forwards.
-- F1's election timer, were L actually dead, would now fire later
-  than it should.
+With the buggy order, `n1` processes the stale `AppendEntries` like this:
 
-The compounding case is even worse: a partition that has *not*
-healed leaves X periodically retrying. Each retry resets F1's
-deadline and re-pins `self.leader = X`. F1 will never time out and
-never recognize that L is gone, because the stale AE from X is
-itself acting as a (false) liveness signal.
+1. `reset_deadline()` sets `self.election_deadline` to a fresh election
+   timeout even though `n2` is not a valid leader for term 5.
+2. `maybe_step_down(message)` and `maybe_accept_leader(message)` happen to
+   leave the canonical state unchanged for this lower-term message, but they
+   still ran before the handler established that the message was acceptable.
+3. The handler finally observes `incoming_term < self.term`, sends a failed
+   `AppendEntriesOk`, and returns.
 
-## Why the Cluster Doesn't Always Catch You
+The reply is correct, but the deadline side effect already happened. If `n0` is
+actually down or partitioned away, repeated stale heartbeats from `n2` can keep
+pushing `n1`'s election deadline into the future, delaying or preventing a new
+election. `n1` keeps treating old-term traffic as proof that it recently heard
+from a viable leader.
 
-In a healthy network, no stale-term AppendEntries are in flight.
-Every AE that reaches a follower is from the current term's leader.
-The buggy order produces identical behavior to the correct order in
-that regime.
+The canonical ordering avoids both outcomes. `n1` rejects the term-2
+`AppendEntries` before `reset_deadline()`, `maybe_step_down(message)`, or
+`maybe_accept_leader(message)` can run. A stale message may produce a
+`success=False` reply, but it cannot refresh liveness state.
 
-The bug needs a node that thinks it's leader at a stale term and is
-willing to send. Two ways that happens:
+## Additional Issues
 
-1. **Partition healing.** A node isolated long enough that the
-   cluster advanced terms without it. When the partition heals, the
-   stale leader's replication loop pushes a flurry of AEs before its
-   own state catches up.
-2. **Slow step-down propagation.** A leader has been demoted (via
-   `become_follower_if_applicable` on a higher-term RV), but its
-   in-flight AEs from before the demotion are still landing on
-   followers.
+This bug is quiet in a healthy network because every `AppendEntries` usually
+comes from the current leader's term. It becomes visible under partition and
+delay scenarios:
 
-Both are textbook partition-nemesis scenarios. The bug is invisible
-on quiet networks.
+- **Partition healing.** A formerly isolated leader can send a burst of
+  old-term `AppendEntries` before it learns the cluster has advanced.
+- **Delayed in-flight messages.** `AppendEntries` sent before a leader steps
+  down can arrive after followers have already moved to a higher term.
+- **Repeated stale heartbeats.** If stale heartbeats keep arriving, the faulty
+  election deadline reset turns them into a false signal that a current leader
+  is alive.
 
-## The Right Mental Model
+These executions are exactly the kind of timing Maelstrom's partition nemesis
+creates. The resulting symptom is usually temporary unavailability caused by
+delayed elections. The bug does not need to corrupt the log to violate the
+service contract; failing to elect a current leader is enough for the workload
+to stop making progress.
 
-An RPC handler has two phases, and they have to stay in order:
+A related, more severe failure appears if the leader-id acceptance path is also
+weakened. If `maybe_accept_leader(message)` or equivalent logic trusts
+`leader_id` without checking the message term, the same bad ordering can set
+`self.leader` to an obsolete node. Then a follower can forward client `read`,
+`write`, or `cas` requests to that stale `leader_id` through
+`try_persist_or_forward_entry()`. The current canonical helper contains its own
+term guard, so this leader-redirection symptom is a related implementation
+risk, not the minimal ordering bug by itself.
 
-1. **Validate.** Decide whether the message is one this node should
-   act on at all. Term checks live here. So does any sanity check
-   about source, message type, or expected state.
-2. **Process.** Update local state, emit replies, run side effects.
+## Implementation Note
 
-Mixing the two — running side effects before validation completes —
-is the same bug as a web handler that writes to the database
-before checking the auth token. It "works" in the happy path
-because no malicious or stale requests arrive, and it fails
-silently the moment one does.
+Keep the handler split into two phases:
 
-The election-deadline reset and the leader-id update are *side
-effects* of accepting an AppendEntries. Both belong after the term
-check, not before.
+1. **Validate the term.** For `AppendEntries`, if `incoming_term < self.term`,
+   send `MessageType.APPEND_ENTRIES_OK` with `success=False`, the receiver's
+   current `term`, the receiver's current `leader_id` value from `self.leader`,
+   and the request's `prev_log_index`, then return.
+2. **Process an acceptable message.** Only after the stale-term return is ruled
+   out should the handler call `reset_deadline()`, `maybe_step_down(message)`,
+   `maybe_accept_leader(message)`, check `prev_log_index` and `prev_log_term`,
+   apply `entries`, advance from `leader_commit`, and send the final
+   `AppendEntriesOk`.
 
-A subtler corollary: `become_follower_if_applicable` is its own
-small handler, and it has the same two-phase structure internally —
-its term comparison decides whether to step down. But the
-side-effect branch inside it that updates `self.leader` from
-`message.body.leader_id` is *not* gated by that term comparison —
-it trusts the leader-id field from any message type, including
-`RequestVote` (no real leader-id) and failure replies (which echo
-the *follower's* belief, not the leader's). So even if you fix the
-ordering in `handle_append_entries`, the inner side-effect path can
-still mis-fire from other call sites that don't gate it.
-
-The cleanest fix to the ordering bug above is the conservative one:
-both side effects move below the term check. The leader-id trust
-issue is a separate fix in a separate place.
-
-## The General Lesson
-
-Any handler whose body contains *both* "decide this message is
-valid" and "update state based on this message" must execute those
-in that order, regardless of how tempting it is to put
-"bookkeeping" first. The bookkeeping is part of accepting the
-message.
-
-The same pattern shows up in:
-
-- **HTTP servers** that log request bodies before authenticating —
-  attacker-supplied data lands in logs whether or not the request
-  was legitimate.
-- **State-machine replication** generally: any "I heard from peer X"
-  signal must be predicated on the message being a current-epoch
-  message, not just on it having arrived.
-- **Distributed lock services** where a heartbeat from a client
-  whose lease has expired is sometimes mistakenly used to renew the
-  lease.
-
-The mechanical rule: if a handler has an early-return reject path,
-put it as the *literal first* logic after parsing. Everything else
-is a side effect predicated on the reject not firing.
+The mechanical test is simple: if a line changes `self.election_deadline`,
+`self.state`, `self.term`, `self.voted_for`, `self.votes`, `self.leader`, the
+log, or `self.commit_index`, it belongs after the stale-term guard unless that
+line is part of the guard's failure reply.
