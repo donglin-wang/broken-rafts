@@ -1,0 +1,16 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..c5938c5 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -249,9 +249,8 @@ class RaftNode(Node):
+                     self.follower_next_indexes[src],
+                 )
+             else:
+-                self.follower_next_indexes[src] = min(
+-                    self.follower_next_indexes[src],
+-                    body["prev_log_index"],
++                self.follower_next_indexes[src] = (
++                    self.follower_next_indexes[src] - 1
+                 )
+ 
+             self.commit_and_reply_if_applicable()

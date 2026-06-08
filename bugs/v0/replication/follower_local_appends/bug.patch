@@ -1,0 +1,12 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..4363a58 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -372,6 +372,7 @@ class RaftNode(Node):
+             self.replication_signal.set()
+             self.log(f"Pending reply at index {self.record.last_index()} for {message}")
+         elif self.leader is not None:
++            self.record.append(entry)
+             self.forward(self.leader, message)
+         else:
+             self.send(

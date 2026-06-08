@@ -1,210 +1,136 @@
-# Followers Don't Append (Even on Forward)
+# Followers Locally Append Forwarded Client Requests
 
-## The Gotcha
+## Description
 
-When a client write lands on a follower, the follower has to forward it
-to the leader — fine. The tempting micro-optimization is "while I'm at
-it, I'll also append the entry to my own log; the leader is going to
-replicate it back to me anyway, so I'm just front-running the work."
+The bug is letting a follower append a client operation to its own `record`
+before forwarding the original client message to the known leader. In the
+canonical implementation, only the leader appends in
+`try_persist_or_forward_entry`:
 
-That is a safety bug, not an optimization. Only the leader is allowed
-to extend the log. A follower that appends locally creates **phantom
-entries** that no leader has sanctioned, and those phantoms can win
-elections, propagate to the cluster, and produce double-applies —
-the symptom is that a client observes state that no quorum
-ever stored, but the root cause here is forged log entries on the
-follower rather than reads outrunning commit.
-
-## What I Built First
-
-`try_persist_or_forward_entry` had three branches:
-
-```
-if state == LEADER:
-    record.append(entry)
-    pending_ok[last_index] = message
-    replicate
-elif leader is not None:
-    record.append(entry)        # <-- the bug
-    forward(leader, message)
-else:
-    error(TEMPORARILY_UNAVAILABLE)
+```python
+def try_persist_or_forward_entry(self, entry: LogEntry, message: Message[Any]):
+    if self.state == State.LEADER:
+        self.record.append(entry)
+        self.pending_replies[self.record.last_index()] = message
+        self.replication_signal.set()
+    elif self.leader is not None:
+        self.forward(self.leader, message)
+    else:
+        self.send(
+            message["src"],
+            {
+                "type": MessageType.ERROR,
+                "code": ErrorCode.TEMPORARILY_UNAVAILABLE,
+                "in_reply_to": reply_id(message),
+                "text": "No leader elected",
+            },
+        )
 ```
 
-The middle branch is the offender. The follower mutates its own log
-without ever having received an `AppendEntries` for that entry.
+The buggy version changes the forwarding branch into:
 
-## Why It's Wrong (The Principle)
-
-Raft's safety rests on a single invariant for the log: **the leader's
-log is authoritative; followers only mutate their log in response to
-`AppendEntries` from the current leader.** Every safety property in §5
-of the paper — Log Matching, Leader Completeness, State Machine Safety
-— assumes followers are passive log recipients. The moment a follower
-extends its log on its own, all of those proofs lose their footing for
-that node.
-
-The phantom entry has two attributes that make it dangerous:
-
-1. Its `term` is set to `self.term` at the moment of append — usually
-   the *current* term, which makes it look maximally up-to-date.
-2. It bumps `record.last_index()` and `record.last_term()` — the two
-   quantities every other node consults during the election
-   "up-to-date" check (§5.4.1).
-
-Together, those two things let a follower with phantoms win elections
-it has no business winning.
-
-## Concrete Trace: Phantom Wins an Election
-
-Three-node cluster: leader `n0`, followers `n1` and `n2`. All logs
-agree at `[A, B]` (indices 1 and 2), term 5.
-
-**T=0** — client `c1` sends `write x=9` to `n1`. `n1` is not leader,
-so it takes the buggy branch:
-
-- `n1.record.append({term: 5, op: write x=9})` → `n1`'s log is now
-  `[A, B, F]`, with `F.term = 5`. Index 3.
-- `n1.forward(n0, c1_msg)`.
-
-`n1`'s `last_index` is now 3, `last_term` is 5. `n0` and `n2` still
-see `last_index=2`. `n0` hasn't yet appended `F`.
-
-**T=10ms** — the network drops the forwarded message before `n0`
-receives it. (No nemesis required; Maelstrom drops messages on the
-happy path.) The client will eventually retry, but for now `n0` knows
-nothing about `F`.
-
-**T=600ms** — `n1`'s election timer fires (it was a long-tail timeout
-draw). `n1` becomes a candidate in term 6 and sends
-`request_vote{term: 6, last_log_index: 3, last_log_term: 5}` to `n0`
-and `n2`.
-
-**T=605ms** — `n0` and `n2` evaluate the up-to-date rule:
-
-- Their own `last_log_term` is 5, candidate's is 5 → tied.
-- Their own `last_log_index` is 2, candidate's is 3 → candidate is
-  *more* up-to-date.
-
-So both grant the vote. `n1` wins the election in term 6, despite the
-fact that `F` was never replicated to anyone.
-
-**T=610ms** — `n1` becomes leader. Its log is `[A, B, F]`. It starts
-sending `AppendEntries` to `n0` and `n2` with `prev_log_index=2,
-entries=[F]`. They append `F` (passes the `prev_log_index/term`
-check). Once a majority has it, `n1` advances `commit_index` to 3 and
-applies `F`: `snapshot[x] = 9`.
-
-The cluster has now committed a write that the client never confirmed
-and may never have intended to repeat. From the client's view: it
-forwarded `write x=9`, got no response, eventually timed out, retried.
-The retry could land elsewhere as a *new* request, get committed
-again. Now `x=9` was applied twice — and this is one of the failure
-modes a per-client session table (sequence numbers + cached
-responses) is supposed to prevent, except the session table can't
-help here because the *first* application happened without ever
-flowing through a client request that carried a sequence number the
-leader had registered.
-
-## Compounding: `apply_entries` Doesn't Truncate
-
-The trace above was the "lucky" case where the phantom-carrying
-follower also happened to win the election cleanly. The unluckier
-case shows up when the phantom-carrying node *doesn't* win, and the
-real leader's `AppendEntries` arrives later.
-
-Look at `Record.apply_entries`. The loop overwrites in place and then
-appends the tail of `incoming_entries`, but it **never truncates
-existing entries past the end of the incoming batch**:
-
-```
-[A, B, F-phantom]                        # follower's log
-AppendEntries(prev=2, entries=[C])       # from real leader
-->  __entries[2] = C  # F-phantom overwritten
-->  end of loop: [A, B, C]               # works in this case
+```python
+elif self.leader is not None:
+    self.record.append(entry)  # BUG: follower forges a local log entry
+    self.forward(self.leader, message)
 ```
 
-So far so good. But:
+That local append looks like a harmless latency optimization: the leader will
+probably replicate the same request back to the follower later, so the follower
+appears to be doing the work early. It is not harmless. A Raft follower may
+change its log only when it handles an `APPEND_ENTRIES` message whose
+`prev_log_index`, `prev_log_term`, `entries`, and `leader_commit` fields come
+from the current leader. Appending in the forward path bypasses that handshake
+and creates a log entry that no leader placed there.
 
+The forged entry is dangerous because the client handlers build it with
+`term: self.term`. Once appended, it raises `record.last_index()` and may also
+raise or preserve `record.last_term()`. Those are exactly the values advertised
+as `last_log_index` and `last_log_term` in a later `REQUEST_VOTE`. A follower
+that only forwarded a client request can therefore make itself look more
+up-to-date than nodes whose logs contain only leader-issued entries.
+
+## Example
+
+Start with three nodes: `n0`, `n1`, and `n2`. `n0` is leader in term 1.
+All nodes have the same committed log:
+
+```text
+index: 1  2
+log:   A  B
+term:  1  1
 ```
-[A, B, F-phantom, G-phantom, H-phantom]  # two more phantoms accumulated
-AppendEntries(prev=2, entries=[C])
-->  __entries[2] = C
-->  end: [A, B, C, G-phantom, H-phantom] # phantoms past index 3 SURVIVE
+
+The following execution shows a direct violation of Raft's log-matching
+property. During the partition, messages between `n0` and `n1` are delayed or
+dropped, but `n0` and `n2` can still communicate and form a majority.
+
+```mermaid
+sequenceDiagram
+    participant C1 as c1
+    participant C2 as c2
+    participant N0 as n0 leader, term 1
+    participant N1 as n1 follower, term 1
+    participant N2 as n2 follower, term 1
+
+    C1->>N1: write x=9
+    Note over N1: buggy forward branch appends F at index 3<br/>F = {term: 1, op: write x=9}
+    N1--xN0: n1 partittioned, forwarded write x=9 is dropped
+
+    C2->>N0: write x=2
+    Note over N0,N2: n0 replicates H at index 3 to n2, H is replicated to majority<br/>H = {term: 1, op: write x=2}
+    N0-->>C2: write_ok for H
+
+    Note over N0,N1: log-matching is now violated<br/>n0 has H at index 3, term 1<br/>n1 has F at index 3, term 1
+
+    Note over N1: n1 wins term 2 election<br/>last_log_index=3, last_log_term=1
+    C1->>N1: read x
+    Note over N1: leader appends R at index 4<br/>R = {term: 2, op: read x}
+    N1->>N0: APPEND_ENTRIES prev_log_index=3, prev_log_term=1, entries=[R]
+    N0-->>N1: APPEND_ENTRIES_OK success=true, match_index=4
+    Note over N1: commit_and_reply_if_applicable commits index 4<br/>n1 applies F, then R
+    N1-->>C1: read_ok value=9
+
+    Note over N0: n0 wins term 3 election<br/>its log also has R at index 4, term 2
+    C2->>N0: read x
+    Note over N0: leader appends S at index 5<br/>S = {term: 3, op: read x}
+    N0->>N1: APPEND_ENTRIES prev_log_index=4, prev_log_term=2, entries=[S]
+    N1-->>N0: APPEND_ENTRIES_OK success=true, match_index=5
+    Note over N0: commit_and_reply_if_applicable commits index 5<br/>n0 applies S after H and R
+    N0-->>C2: read_ok value=2
 ```
 
-The Raft paper §5.3 is explicit: "If an existing entry conflicts with
-a new one (same index but different terms), delete the existing entry
-and **all that follow it**." Our `apply_entries` does the first half
-and skips the second. Combined with locally-appended phantoms, the
-follower's log can carry stale ghost entries indefinitely. If that
-follower later wins an election (see previous trace), it will
-propagate the ghosts.
+The violation happens before the election for term 2:
 
-This is technically a separate bug from the local-append, but the two
-amplify each other. Local-appends manufacture the phantoms;
-non-truncating `apply_entries` lets them survive contact with the
-real leader.
+```text
+n0: [A, B, H]   H = {term: 1, op: write x=2}
+n1: [A, B, F]   F = {term: 1, op: write x=9}
+n2: [A, B, H]   H = {term: 1, op: write x=2}
+```
 
-## Pending_ok Doesn't Save You
+Because reads are implemented as log entries, the bad prefix can affect reads even
+when the read entries themselves are leader-owned and replicated normally. `c1`
+reads from `n1` after `R` commits and gets `9`, because `n1` applies `R` after
+`F`. Later, `c2` reads from `n0` after `S` commits and gets `2`, because `n0`
+applies `S` after `H`. The two reads disagree about the state produced by the
+index-3, term-1 log position: `n1` has that position as `F`, while `n0`
+has it as `H`.
 
-You might think: "fine, but the follower didn't put the message in
-`pending_ok`, so when the phantom commits, no client gets a wrong
-reply." True for the *immediate* commit. But:
+## Implementation Note
 
-- The state machine still mutates. `snapshot[x] = 9` happens on every
-  node that commits the phantom. Future reads will observe it.
-- The original client retried, hit the new leader, and got an `:ok`
-  back for what it thought was its single write. Linearizability is
-  defined over the *committed log* compared against the *operations
-  the client believes happened*. A committed `write x=9` with no
-  corresponding client invocation is not a phantom in the
-  read-side "vanishing state" sense, but it does pollute the model
-  the Knossos checker is reconstructing.
-- For non-idempotent ops (CAS, increment), the second application is
-  a real correctness divergence. A `cas x 5→6` that succeeds on the
-  first leader, then re-applies as a phantom on a new leader, fails
-  the precondition the second time and the snapshots can diverge from
-  what the client model predicts.
+Keep the producer/consumer split strict: the leader produces log entries, and
+followers consume them through `handle_append_entries`. For
+`try_persist_or_forward_entry`, that means:
 
-## The Fix
+- `State.LEADER` appends to `record`, stores the original client `message` in
+  `pending_replies`, and wakes replication.
+- A follower with `self.leader is not None` only calls
+  `forward(self.leader, message)`.
+- A node without a known leader returns `MessageType.ERROR` with
+  `ErrorCode.TEMPORARILY_UNAVAILABLE`.
 
-The follower's job in the forward branch is exactly one thing:
-**relay the message.** No log mutation, no `pending_ok` entry, no
-local bookkeeping. The leader will append at its own next index, will
-own the `pending_ok` slot, and will reply to the client when commit
-advances.
-
-Two corollaries follow from this:
-
-1. The client's `src` must survive the forward, so the leader's reply
-   goes back to the right place. `forward` already preserves `src`
-   via `deepcopy`; just don't add a local append next to it.
-2. If the follower can't reach the leader (no leader known, or the
-   forward send fails), the right answer is the existing
-   `TEMPORARILY_UNAVAILABLE` error, not "I'll hold this for you."
-   Holding pending client requests on a non-leader is the same
-   problem leaders face on step-down, but in reverse: the non-leader
-   has no commit advancement that can ever resolve the record.
-
-Separately, fix `Record.apply_entries` to truncate any tail past the
-end of the incoming batch when there's a conflict at the overwritten
-index. That closes the "phantoms survive overwrite" amplifier even
-if some other path ever manages to introduce a phantom.
-
-## The Mental Model
-
-Raft is built on a strict producer/consumer split for the log: the
-leader produces, followers consume. Every place in the code where a
-non-leader mutates `record` should be suspicious by default — the
-only legitimate case is `handle_append_entries`, and even there it's
-always in response to an explicit leader-issued message that says
-"here are entries, starting at this index, predicated on this prior
-state." Anything that bypasses that handshake is forging the leader's
-signature on log entries.
-
-The phrase to internalize: **a log entry's existence is a leadership
-claim.** If the entry is in the log at index N with term T, the
-implicit assertion is "the leader of term T placed this here." A
-follower writing into its own log breaks that assertion silently, and
-every safety argument downstream depends on it being true.
+Do not compensate by adding follower-side `pending_replies` state. A follower
+has no authority to commit the entry and no reliable event that can make a
+locally queued client request safe to answer. The original client `src` and
+`msg_id` already survive `forward`, so the leader can append the operation at
+the leader's next index and reply when the committed entry is applied.
