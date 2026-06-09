@@ -152,7 +152,7 @@ has completed, and the CAS changed `x` from `10` to `11`. Returning `10`
 pretends the read happened before a completed operation, which violates the
 real-time order clients observed.
 
-## Additional issues
+## Additional Issues
 
 1. **`commit_index` is not a freshness proof.** An old leader may have applied
    every entry through its local `commit_index` and still be missing newer
@@ -164,7 +164,7 @@ real-time order clients observed.
    a stale `self.leader` can route clients to the exact node that must not
    answer locally.
 
-## Implementation note
+## Implementation Note
 
 Make `read` a regular log operation:
 

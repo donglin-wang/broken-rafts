@@ -118,7 +118,7 @@ so `n1` leaves `commit_index` at 1. If index 3 later reaches a quorum,
 then the candidate index becomes 3, `record.at(3)["term"] == 4` is true,
 and `commit_at(3)` safely commits both entries together.
 
-## Additional issues
+## Additional Issues
 
 - The direct client symptom depends on `pending_replies`. Because
   `become_leader` clears `pending_replies`, an old entry inherited across a
@@ -139,7 +139,7 @@ and `commit_at(3)` safely commits both entries together.
   `record.at(index)["term"]`; the vote up-to-date rule is about the
   candidate and receiver last log entries.
 
-## Implementation note
+## Implementation Note
 
 Keep the commit rule tied to the candidate index:
 

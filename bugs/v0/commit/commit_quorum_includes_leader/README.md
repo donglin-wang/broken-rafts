@@ -114,7 +114,7 @@ With Maelstrom's usual three-node `lin-kv` partition test, this presents as
 writes hanging or later operations being rejected with
 `temporarily-unavailable` after leadership churn.
 
-## Additional issues
+## Additional Issues
 
 - The failure also delays follower application. Followers only learn the
   leader's commit point through the `leader_commit` field on later

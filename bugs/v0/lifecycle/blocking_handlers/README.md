@@ -142,7 +142,7 @@ This differs from Example 1:
 The observed symptom can be identical: the client waits until the replication
 timeout even though the network was healthy and the follower responded quickly.
 
-## Additional issues
+## Additional Issues
 
 Blocking replication also introduces broader operational problems:
 
@@ -162,7 +162,7 @@ Blocking replication also introduces broader operational problems:
    preserved, the implementation now needs extra duplicate-response and
    pending-request cleanup logic that the nonblocking design avoids.
 
-## Implementation note
+## Implementation Note
 
 Do not wait for remote replication while holding the node lock, and do not make
 client response depend on the client handler remaining alive.
