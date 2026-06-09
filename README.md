@@ -51,7 +51,6 @@ git apply -R <path-to-bug>/bug.patch
   - `node.py` contains the Maelstrom JSON protocol plumbing.
 - `bugs/v0/` - v0 bug writeups and, for patch-backed bugs, patch artifacts.
   Bugs are organized by subsystem. Browse the folder for the current set.
-- `src/README.md` - short note on canonical implementation versioning.
 - `pyproject.toml` / `uv.lock` - Python project metadata and locked tooling.
 
 Patch files are versioned by directory. A patch under `bugs/v0/` is expected to

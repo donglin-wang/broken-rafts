@@ -81,8 +81,6 @@ sequenceDiagram
     Note over n0: buggy update records n1 match_index=6
     Note over n0: median([6,6,0]) = 6
     n0-->>c: WriteOk after commit_at(6)
-    c->>n0: read x
-    n0-->>c: ReadOk(x=1)
     n0--x n1: partitions before entry 6 replicates
     n0--x n2: partitions before entry 6 replicates
     n1->>n2: RequestVote(last_log_index=5)
@@ -161,10 +159,9 @@ though no follower actually stores entry 6.
 The safety break becomes visible if `n0` is partitioned away before a later
 replication sends entry 6 to either follower. `n1` and `n2` can elect a leader
 whose log stops before entry 6. The client has already observed `WriteOk` for
-`x = 1`, and may also have observed a `ReadOk` returning `x = 1` from `n0`.
-After the election, the same client can read from the new leader and observe the
-older value `x = 0`. That history cannot be linearized because the successful
-write disappeared after it had already been observed.
+`x = 1`. After the election, the same client can read from the new leader and
+observe the older value `x = 0`. That history cannot be linearized because the
+successful write disappeared after it had already been acknowledged.
 
 This does not fail on every run because a later replication round may send
 entry 6 to `n1` before leadership changes. The mistaken `match_index` is then

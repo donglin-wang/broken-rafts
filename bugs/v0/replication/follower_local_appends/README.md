@@ -75,7 +75,7 @@ sequenceDiagram
 
     C1->>N1: write x=9
     Note over N1: buggy forward branch appends F at index 3<br/>F = {term: 1, op: write x=9}
-    N1--xN0: n1 partittioned, forwarded write x=9 is dropped
+    N1--xN0: n1 partitioned, forwarded write x=9 is dropped
 
     C2->>N0: write x=2
     Note over N0,N2: n0 replicates H at index 3 to n2, H is replicated to majority<br/>H = {term: 1, op: write x=2}
