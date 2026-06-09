@@ -1,182 +1,162 @@
 # Stale-Term Acks: Replies From A Previous Leadership Tenure
 
-## The Bug
+## Description
 
-`handle_append_entries_ok` originally bailed out only on the
-step-down or not-leader cases:
+`handle_append_entries_ok` must ignore `AppendEntriesOk` replies that were sent
+in a different Raft term. A buggy implementation only checks whether the message
+forces a step-down and whether the local node is still a leader:
 
 ```python
-if (
-    self.become_follower_if_applicable(message)
-    or self.state != State.LEADER
-):
+if self.maybe_step_down(message) or self.state != State.LEADER:
     return
 ```
 
-Missing: a check that the **ack's term matches the leader's current
-term**. Without it, a delayed `AppendEntriesOk` from a prior
-leadership tenure (term N) is processed by the same node now leading
-at term N+k as if it were a current-term acknowledgement.
+That looks like a term check, but it only handles one side of the comparison.
+`maybe_step_down` demotes the node when `message["body"]["term"] > self.term`.
+It deliberately does nothing for `message["body"]["term"] < self.term`: a
+lower-term message does not prove that the local node is obsolete. The message
+is still obsolete, though, and its body must not update current-term leader
+state.
 
-The fix is one extra clause:
+The canonical handler keeps those responsibilities separate:
 
 ```python
 if (
-    self.become_follower_if_applicable(message)
+    self.maybe_step_down(message)
     or self.state != State.LEADER
     or message["body"]["term"] != self.term
 ):
     return
 ```
 
-Same guard you already apply (or should apply) at every other
-incoming-RPC handler. §5.1 of the Raft paper states it as a universal
-rule: *"if a server receives a request with a stale term number, it
-rejects the request."* The same must hold for replies — a reply from
-a stale term carries no information about your current term.
+The missing guard lets an old `AppendEntriesOk` from a previous leadership
+tenure update `follower_match_indexes` and `follower_next_indexes` after the
+same node later becomes leader in a newer term:
 
-## Why It Looks Reasonable
+```python
+if body["success"] is True:
+    self.follower_match_indexes[src] = max(
+        body["match_index"], self.follower_match_indexes[src]
+    )
+    self.follower_next_indexes[src] = max(
+        body["match_index"] + 1,
+        self.follower_next_indexes[src],
+    )
+else:
+    self.follower_next_indexes[src] = min(
+        self.follower_next_indexes[src],
+        body["prev_log_index"],
+    )
+```
 
-The Raft paper's pseudocode for `AppendEntriesOk` doesn't restate
-the term filter — it shows the success-path update in three lines.
-If you transcribe just those three lines, the filter is missing.
+For a stale successful reply, `body["match_index"]` describes what the follower
+accepted in an earlier term, in response to an earlier `AppendEntries` request.
+It is not evidence that the follower currently stores that index. Another leader
+may have overwritten the follower's log before the reply arrives.
 
-The `become_follower_if_applicable` call also *looks* like it covers
-term checking, and for `>` it does. But it deliberately doesn't fire
-on `incoming_term < self.term` (you don't *step down* in response to
-a stale message — you ignore it). So a stale-term ack passes through
-that check untouched and into the success branch.
+The bug is a reply-side version of Raft's term discipline: every RPC body is
+scoped to the `term` it carries. Requests with lower terms are rejected or
+ignored; replies whose `term` does not match the local term must be ignored
+before their success or failure fields are used.
 
-Short version: the step-down hook and the stale-message filter are
-two different responsibilities, and conflating them leaves a gap on
-the lower-term side.
+## Example
 
-## A Trace That Goes Unsafe
+Three-node cluster: n0, n1, and n2.
 
-Three-node cluster: A, B, C. A is leader at term 5.
+The trace starts with a specific uncommitted-log shape:
 
-**T=0** — A sends `AppendEntries` to B carrying entries through
-index 10 (term 5). B applies them. B's log: `[..t5×10]`. B sends
-`AppendEntriesOk` with `match_index=10, term=5`. The reply gets
-delayed in the network.
+- n0 and n1 share an old suffix through index 3, whose last entry is from term
+  1.
+- n2 has a shorter suffix through index 2, but its last entry is from term 2.
 
-**T=50ms** — A is partitioned away from B and C. A's heartbeats
-stop reaching the others. B and C run an election. C wins term 6.
-C's log diverges from A's at, say, index 5 (C's log was shorter at
-the divergence point but won §5.4.1 by some other path — exact
-details aren't load-bearing).
+That makes n2's log more up-to-date than n1's for elections, even though it is
+shorter. n0 then wins term 3 with n1's vote and sends n1 a heartbeat/probe for
+the old suffix. n1 accepts the consistency check and sends a reply:
 
-**T=200ms** — C, as leader at term 6, sends `AppendEntries` to B
-that overwrites B's log from index 5 onward. B's log is now
-`[..t1..t3..t6×3]` — only 8 entries, none of them the term-5
-entries B previously acked.
+```python
+{
+    "type": MessageType.APPEND_ENTRIES_OK,
+    "term": 3,
+    "success": True,
+    "match_index": 3,
+}
+```
 
-**T=500ms** — Partition heals. A learns of term 6 from a heartbeat,
-steps down briefly, and after another election cycle wins term 7.
-A's log at this point is whatever survived: say
-`[..t1..t3..t5×4..t7×1]`.
+That reply was accurate when n1 sent it: at that moment, n1 had an entry at
+index 3 matching n0's log. It is not evidence about what n1 stores after later
+terms rewrite the log.
 
-**T=510ms** — B's original `AppendEntriesOk` from T=0 finally
-arrives at A. Its body says `term=5, success=true, match_index=10`.
+```mermaid
+sequenceDiagram
+    participant n0
+    participant n1
+    participant n2
 
-**Without the term filter:**
+    Note over n0,n2: n0 and n1 have old term-1 entry at index 3, n2 has term-2 entry at index 2
+    Note over n0,n1: n0 wins term 3 with n1's vote
+    n0->>+n1: AppendEntries(term=3, prev_log_index=3, entries=[])
+    Note over n1: n1 sends AppendEntriesOk(term=3, match_index=3), <br/> but it won't reach n0 until later
 
-- `become_follower_if_applicable` does nothing (5 < 7).
-- `self.state == LEADER`, so we proceed.
-- Success branch fires. A sets `follower_match_indexes[B] = 10`.
+    Note over n1,n2: n0 is partitioned, n1 and n2 elect n2 as leader for term 4
+    n2->>n1: AppendEntries(term=4, prev_log_index=1, entry=index 2 term 2)
+    Note over n1: n1 replaces index 2 and drops old index 3
+    n1-->>n2: AppendEntriesOk(term=4, success=true, match_index=2)
 
-But B does not have 10 entries. B has 8, and none of the entries
-above index 5 match what A's log has at those positions. A has just
-recorded a `match_index` that is **a fact about a snapshot of B's
-state from two leadership tenures ago**, not about B's current log.
+    Note over n0,n2: partition heals, n2 replicates its term-2 entry to n0
+    n2->>n0: AppendEntries(term=4, prev_log_index=1, entry=index 2 term 2)
+    Note over n0: n0 steps down, replaces index 2, and drops old index 3
+    n0-->>n2: AppendEntriesOk(term=4, success=true, match_index=2)
 
-**T=515ms** — Median across A's view: `[A's last_index, 10 (B,
-fake), C's match_index]` → easily 10 or higher. A advances
-`commit_index` past entries that B *does not currently have* and
-that no quorum currently stores.
+    Note over n0,n2: n0 later wins term 5 and appends a client request at index 3
+    n1-->>-n0: delayed AppendEntriesOk(term=3, success=true, match_index=3)
+    Note over n0: Buggy handler records n1 at match_index=3 for term 5 <br/> n0 falsely believes index 3 has reached a majority <br/> n0 commits index 3 at term 5
+    Note over n0,n2: Invariant violated: n0 commits a term-5 entry at index 3 without a real majority storing it
+```
 
-A applies one of its term-5 entries and replies `:ok` to a client.
-If A loses leadership again before re-replicating, that `:ok` is a
-phantom commit. **Linearizability violated.**
+When the delayed reply finally reaches n0, n0 is leader at term 5. In the buggy
+handler:
 
-## Why The Cluster Doesn't Always Catch You
+1. `maybe_step_down(message)` returns `False`, because the incoming term 3 is
+   lower than `self.term`.
+2. `self.state != State.LEADER` is false, because n0 is again a leader.
+3. There is no `message["body"]["term"] != self.term` guard.
+4. n0 records `follower_match_indexes["n1"] = 3`.
 
-This bug needs a specific timing sandwich:
+That `match_index` is stale. It was true when n1 sent the term-3 reply, but
+n1's log was later rewritten by n2's term-4 `AppendEntries`. n1 does not have
+n0's new term-5 entry at index 3.
 
-1. Leader L sends an AE.
-2. L loses leadership before the ack arrives.
-3. A different leader takes over and rewrites the follower's log in
-   the relevant range.
-4. L regains leadership.
-5. The original ack only now arrives at L.
+The false replication record can advance n0's commit calculation:
 
-In a steady-state cluster the ack arrives well within one tenure and
-the term matches. The bug requires leader churn *during* a single
-in-flight round-trip — which Maelstrom's partition nemesis produces
-on purpose.
+```python
+index = median([self.record.last_index(), *self.follower_match_indexes.values()])
+if self.commit_index < index and self.record.at(index)["term"] == self.term:
+    self.commit_at(index, send_reply=True)
+```
 
-It also compounds badly with the bug where `match_index` is
-derived from the leader's current log state instead of the request
-that elicited the ack. If you've fixed that one with the
-"echo back" approach so the follower's reply carries the precise
-`prev_log_index` and accepted-count, the reply now contains an
-authoritative-looking `match_index` value — and the stale-term
-filter is what stops you from believing it.
+For a three-node cluster, the median includes n0's own `record.last_index()` and
+the two follower match indexes. In the trace, only n0 really stores the term-5
+entry at index 3. n1 only appears to have acknowledged index 3 because of the
+stale term-3 reply. The calculation sees n0 and stale n1 at index 3 and treats
+that as a majority. Because `record.at(3)["term"] == self.term`, n0 passes the
+current-term commit guard and moves `commit_index` to 3.
 
-## The Right Mental Model
+That commit is not durable on a real majority. The term-5 entry at index 3 is
+stored only on n0; n1's current log does not contain it, and n2 has not
+acknowledged it. The violated invariant is the commit-safety property Raft
+relies on for linearizability: once a leader commits a log entry, that entry
+must be stored on a real majority and present in every future leader's log.
 
-Every RPC in Raft is contextual to a specific term. A request says
-"in term N, do X"; a reply says "in term N, X happened (or didn't)."
-A reply from term N has *nothing* to say about state in term N+k,
-because:
+## Implementation Note
 
-- The follower may have rolled forward and rolled back log entries
-  any number of times between the two terms.
-- The leader's own log may have diverged from what it had when it
-  sent the original request.
-- Even the *meaning* of `match_index` is term-scoped: an index
-  number is only interpretable in the context of a specific log
-  history.
+Do not fold stale-message filtering into `maybe_step_down`. Step-down and
+message validity answer different questions:
 
-The mechanical rule is simple: at the top of every RPC handler
-(request *or* reply), drop messages whose term doesn't match the
-expected one.
+- `maybe_step_down` asks whether the local node has discovered a newer term and
+  must stop acting as leader or candidate.
+- The `message["body"]["term"] != self.term` guard asks whether this reply
+  describes the current term.
 
-- For requests: `incoming_term < self.term` → reply false (or
-  ignore).
-- For replies: `incoming_term != self.term` → ignore. (Note: not
-  `<` — `>` is also stale, in the sense that you've stepped down,
-  and `become_follower_if_applicable` should already have demoted
-  you before the filter runs.)
-
-## The General Lesson
-
-Filtering by term and *handling step-down* are two different
-responsibilities and want two different lines of code. It's tempting
-to consolidate them in one helper because they both touch
-`incoming_term vs self.term`, but they answer different questions:
-
-- **Step-down** is about *me*: "do I now know I'm not the latest
-  authority? If so, demote myself."
-- **Stale filter** is about *the message*: "is this message
-  describing a world I still inhabit? If not, drop it."
-
-A higher incoming term answers yes to step-down. A lower incoming
-term doesn't trigger step-down at all but should still drop the
-message. A helper that only does step-down on `>` will silently let
-stale `<`-term replies through.
-
-The same rule shows up wherever there's a logical clock and
-asynchronous replies:
-
-- Lamport-clock RPCs that carry a sender clock alongside the body.
-- Distributed leases where a holder's view of "I have the lease"
-  must be validated against the message's lease epoch, not just the
-  current epoch.
-- Anywhere the protocol round number can advance between send and
-  receive.
-
-Whenever you find a handler that begins with "step down if needed,
-then process," ask: *what about messages from a strictly-earlier
-round?* Step-down doesn't fire on those, but they almost certainly
-shouldn't be processed either.
+For replies such as `RequestVoteOk` and `AppendEntriesOk`, the safe rule is:
+first step down on a higher term, then ignore the reply unless the node is still
+in the expected state and the reply's `term` exactly equals `self.term`.

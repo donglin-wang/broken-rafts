@@ -67,4 +67,13 @@ point being made.
 - Generate `bug.patch` with `git diff` from the canonical implementation change,
   then revert the canonical implementation so the patch is the only artifact
   left behind.
+- When reviewing a bug trace, first check that the execution can actually occur
+  assuming every implementation detail outside the described bug is correct.
+  For Raft traces, validate election eligibility, log freshness, term changes,
+  append consistency checks, quorum calculations, and commit guards before
+  accepting the trace as evidence.
+- Also review writeups for consistency and coherence: the description,
+  diagram, example prose, message fields, terms, indexes, node states, and
+  claimed invariant violation should agree with each other and within the trace
+  itself.
 - Do not overwrite unrelated user changes in the worktree.

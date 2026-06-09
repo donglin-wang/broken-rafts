@@ -1,0 +1,12 @@
+diff --git a/src/v0/raft.py b/src/v0/raft.py
+index 8b9c6c2..0c74c4f 100755
+--- a/src/v0/raft.py
++++ b/src/v0/raft.py
+@@ -234,7 +234,6 @@ class RaftNode(Node):
+             if (
+                 self.maybe_step_down(message)
+                 or self.state != State.LEADER
+-                or message["body"]["term"] != self.term
+             ):
+                 return
+ 
